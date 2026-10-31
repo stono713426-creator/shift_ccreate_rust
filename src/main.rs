@@ -1,13 +1,15 @@
 //! 勤務シフト自動生成システム エントリーポイント (`main.rs`)
 //!
 //! Version: v1.0.0
-//! Updated: 2026-10-31 - Phase 3 実装: CLI バッチ実行（引数あり）および Phase 4 GUI スタブ対応
+//! Updated: 2026-10-31 - Phase 4 実装: GUI 起動（引数なし / --gui）および CLI バッチ実行のハイブリッド対応
 //!
 //! 使い方:
-//!   - CLI バッチ実行: `shift_create_rust.exe <入力Excelパス> [出力Excelパス]`
-//!   - 引数なし起動: デスクトップ GUI 起動（Phase 4 で eframe/egui 実装予定）
+//!   - デスクトップ GUI 起動: `shift_create_rust.exe` (引数なし起動)
+//!   - CLI バッチ実行      : `shift_create_rust.exe <入力Excelパス> [出力Excelパス]`
+//!   - ヘルプ表示          : `shift_create_rust.exe --help`
 
 use shift_core::generator::{GenerateOptions, ShiftGenerator};
+use shift_core::gui::run_gui;
 use shift_core::holidays::get_holidays;
 use shift_core::parser::parse_shift_excel;
 use shift_core::VERSION;
@@ -18,8 +20,17 @@ use std::time::Instant;
 fn main() {
     let args: Vec<String> = env::args().collect();
 
-    // 引数なし起動時: Phase 4 GUI への誘導またはヘルプ表示
-    if args.len() < 2 {
+    // 引数なし、または --gui 指定時: デスクトップ GUI を起動
+    if args.len() < 2 || (args.len() == 2 && args[1] == "--gui") {
+        if let Err(e) = run_gui() {
+            eprintln!("GUI の起動に失敗しました: {}", e);
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    // ヘルプオプション判定
+    if args[1] == "--help" || args[1] == "-h" {
         print_usage(&args[0]);
         return;
     }
@@ -40,14 +51,19 @@ fn print_usage(prog_name: &str) {
     println!("  勤務シフト自動生成システム (Rust Edition {})", VERSION);
     println!("============================================================");
     println!("使い方:");
-    println!("  {} <入力Excelパス> [出力Excelパス]", prog_name);
+    println!("  {} [オプション | 入力Excelパス] [出力Excelパス]", prog_name);
     println!();
-    println!("引数:");
-    println!("  <入力Excelパス>  : スタッフマスタ・制約条件・手術等を含む勤務条件表Excel");
-    println!("  [出力Excelパス]  : （任意）現場フォーマットで出力するシフト表Excelパス");
+    println!("起動モード:");
+    println!("  引数なし起動    : デスクトップ GUI (eframe / egui) を起動");
+    println!("  CLI バッチ実行  : <入力Excelパス> を指定してバックグラウンド生成");
+    println!();
+    println!("引数・オプション:");
+    println!("  --gui           : 明示的にデスクトップ GUI を起動");
+    println!("  --help, -h      : このヘルプメッセージを表示");
+    println!("  <入力Excelパス> : スタッフマスタ・制約条件・手術等を含む勤務条件表Excel");
+    println!("  [出力Excelパス] : （任意）現場フォーマットで出力するシフト表Excelパス");
     println!("                    未指定時は '{{開始年下2桁}}年{{開始月}}-{{終了月}}月シフト.xlsx'");
-    println!();
-    println!("※ 引数なしで起動した場合は、デスクトップ GUI (Phase 4) が起動します。");
+    println!("============================================================");
 }
 
 /// CLI バッチ実行
@@ -63,7 +79,6 @@ fn run_cli_batch(input_path: &Path, output_path: Option<PathBuf>) {
 
     let total_start = Instant::now();
     println!("1. 祝日カレンダーの取得・計算中...");
-    // 過去〜来年の祝日を網羅（2024〜2030）
     let holidays = get_holidays(2024, 2030);
     println!("   祝日登録件数: {}件", holidays.len());
 

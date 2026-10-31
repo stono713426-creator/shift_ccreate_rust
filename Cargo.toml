@@ -29,9 +29,9 @@ good_lp = { version = "1", features = ["highs"], default-features = false }
 # Phase 3 (現場フォーマット Excel 出力):
 rust_xlsxwriter = "0.80"
 
-# Phase 4 (モダンデスクトップ GUI) - 準備中:
-# eframe = "0.31"
-# rfd = "0.15"
+# Phase 4 (モダンデスクトップ GUI):
+eframe = "0.31"
+rfd = "0.15"
 
 [profile.release]
 opt-level = 3
