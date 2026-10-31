@@ -113,6 +113,10 @@ pub fn calculate_japanese_holidays_range(start_year: i32, end_year: i32) -> Hash
 pub fn get_holidays(start_year: i32, end_year: i32) -> HashMap<NaiveDate, String> {
     const API_URL: &str = "https://holidays-jp.github.io/api/v1/date.json";
 
+    // まず内閣府計算で全日を確実に算出
+    let mut result = calculate_japanese_holidays_range(start_year, end_year);
+
+    // API 取得を試行し、取得できたデータでマージ・更新
     let api_result: Result<HashMap<String, String>, reqwest::Error> = (|| {
         let client = reqwest::blocking::Client::builder()
             .timeout(StdDuration::from_secs(3))
@@ -121,27 +125,17 @@ pub fn get_holidays(start_year: i32, end_year: i32) -> HashMap<NaiveDate, String
         res.json::<HashMap<String, String>>()
     })();
 
-    match api_result {
-        Ok(json_map) => {
-            let mut result = HashMap::new();
-            for (date_str, name) in json_map {
-                if let Ok(d) = NaiveDate::parse_from_str(&date_str, "%Y-%m-%d") {
-                    if d.year() >= start_year && d.year() <= end_year {
-                        result.insert(d, name);
-                    }
+    if let Ok(json_map) = api_result {
+        for (date_str, name) in json_map {
+            if let Ok(d) = NaiveDate::parse_from_str(&date_str, "%Y-%m-%d") {
+                if d.year() >= start_year && d.year() <= end_year {
+                    result.insert(d, name);
                 }
             }
-            // API取得データが空でなければ採用
-            if !result.is_empty() {
-                return result;
-            }
-            calculate_japanese_holidays_range(start_year, end_year)
-        }
-        Err(_) => {
-            // オフラインまたはエラー時は内閣府計算フォールバック
-            calculate_japanese_holidays_range(start_year, end_year)
         }
     }
+
+    result
 }
 
 #[cfg(test)]

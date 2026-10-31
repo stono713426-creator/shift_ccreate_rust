@@ -23,8 +23,8 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# Phase 2 (二段階数理最適化 MILP ソルバー) - 準備中:
-# good_lp = { version = "1", features = ["highs"], default-features = false }
+# Phase 2 (二段階数理最適化 MILP ソルバー):
+good_lp = { version = "1", features = ["highs"], default-features = false }
 
 # Phase 3 (現場フォーマット Excel 出力) - 準備中:
 # rust_xlsxwriter = "0.80"

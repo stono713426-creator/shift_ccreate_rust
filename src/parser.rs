@@ -507,7 +507,7 @@ fn parse_staff_sheet(
                 col_name = Some(c_idx);
             } else if s.contains("所属") || s.contains("セクション") || s.contains("フロア") || s.contains("部署") {
                 col_section = Some(c_idx);
-            } else if s.contains("役職") || s.contains("役割") || s.contains("資格") {
+            } else if s.contains("役職") || s.contains("役割") || s.contains("資格") || s.contains("職種") {
                 col_role = Some(c_idx);
             } else if s.contains("雇用形態") || s.contains("形態") {
                 col_employment = Some(c_idx);
