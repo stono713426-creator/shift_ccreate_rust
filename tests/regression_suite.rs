@@ -1,7 +1,8 @@
-//! 勤務シフト自動生成システム 7大統合回帰テストスイート (`tests/regression_suite.rs`)
+//! 勤務シフト自動生成システム 統合回帰テストスイート (`tests/regression_suite.rs`)
 //!
-//! Version: v1.0.1
-//! Updated: 2026-10-31 - Patch 修正: test_10 小島さん11月特別有休パース・反映・Excel出力検証追加
+//! Version: v1.1.0
+//! Updated: 2026-10-31 - v1.1.0 検証追加: test_11 制約条件パース・除外スタッフ補正・主公休スライド・金曜HIGH1の3名体制検証
+//! - v1.0.1 (2026-10-31): test_10 小島さん11月特別有休パース・反映・Excel出力検証追加
 //! - test_01_holidays: 祝日計算・春分秋分・国民の休日・振替休日検証
 //! - test_02_date_parser_and_specified_off: 日付パーサー・NFKC・指定公休HARD固定＆ISO週義務免除検証
 //! - test_03_substitute_off_in_holiday_week: 祝日と固定公休曜日重複時の振替公休自動設定検証
@@ -18,7 +19,7 @@ use shift_core::generator::{GenerateOptions, ShiftGenerator};
 use shift_core::holidays::{calculate_japanese_holidays, get_holidays};
 use shift_core::parser::{excel_serial_to_date, parse_date_list, parse_shift_excel, ParsedExcelData};
 use shift_core::renderer::render_shifts_to_file;
-use shift_core::solver::{solve_shift, MonthContext};
+use shift_core::solver::{parse_rule_target_dates, solve_shift, MonthContext};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -550,6 +551,141 @@ fn test_10_kojima_november_special_vacation() {
     // 11/16 の指定公休は "公" と出力されていること
     let cell_nov16 = rows[17][k_col].to_string();
     assert_eq!(cell_nov16, "公", "11/16 の小島さんのセル表記は '公' であること");
+
+    let _ = fs::remove_file(&out_path);
+}
+
+// ============================================================================
+// 11. test_11_friday_high1_and_rule_priority_v1_1_0:
+//     シフト制約条件パース・除外スタッフ補正・主公休スライド・金曜HIGH1の3名体制検証
+// ============================================================================
+#[test]
+fn test_11_friday_high1_and_rule_priority_v1_1_0() {
+    let (parsed, holidays) = load_test_excel();
+
+    // 1. シフト制約条件シートの適用条件 (condition_desc) が空文字にならず正確にパースされていること
+    assert!(
+        !parsed.rules.is_empty(),
+        "シフト制約条件が1件以上パースされていること"
+    );
+    for rule in &parsed.rules {
+        assert!(
+            !rule.condition_desc.is_empty(),
+            "ルール '{}' の適用条件 (condition_desc) が空でないこと",
+            rule.name
+        );
+    }
+
+    let has_friday_high1 = parsed.rules.iter().any(|r| {
+        r.condition_desc.contains("金曜")
+            && r.level.to_uppercase() == "HIGH1"
+            && r.val_min == 2
+            && r.val_rec == 3
+    });
+    assert!(
+        has_friday_high1,
+        "金曜の HIGH1 (最小2・推奨3) ルールが正確にパースされていること"
+    );
+
+    // 2. parse_rule_target_dates: 「Vit」手術日のUTF-8安全性および 火曜(OPE日) の絞り込み検証
+    let ctx_jan = MonthContext::new(2027, 1, &holidays);
+    let vit_days = parse_rule_target_dates("「Vit」手術日", &ctx_jan, &parsed.ope_dict);
+    for &d in &vit_days {
+        let date = ctx_jan.date_map[&d];
+        let ope_str = parsed.ope_dict.get(&date).expect("OPE日であること");
+        assert!(
+            ope_str.to_lowercase().contains("vit") || ope_str.contains("硝子体"),
+            "「Vit」手術日に該当する日のみ抽出されること: {} -> {}",
+            date,
+            ope_str
+        );
+    }
+
+    let tue_ope_days = parse_rule_target_dates("火曜(OPE日)", &ctx_jan, &parsed.ope_dict);
+    for &d in &tue_ope_days {
+        assert_eq!(ctx_jan.weekday_map[&d], 1, "火曜日のみであること");
+        assert!(
+            parsed.ope_dict.contains_key(&ctx_jan.date_map[&d]),
+            "1/{} は手術のある火曜日であること",
+            d
+        );
+    }
+
+    // 3. 高橋さん除外 (除外フラグ=True 相当) かつ 12月実績引き継ぎ状態での 2027年1〜3月連続生成検証
+    let mut jan_mar_parsed = parsed.clone();
+    // まず 2026年12月を解いて前月実績を作成
+    let res_dec = solve_shift(&parsed, 2026, 12, &holidays);
+    assert!(res_dec.success, "2026年12月のシフト生成が成功すること");
+    jan_mar_parsed.prev_month_main_offs = res_dec.main_offs.clone();
+    let ctx_dec = MonthContext::new(2026, 12, &holidays);
+    let mut dec_tail = HashMap::new();
+    for s in &jan_mar_parsed.staffs {
+        if let Some(sm) = res_dec.shifts.get(&s.name) {
+            let tail: Vec<u8> = (25..=ctx_dec.days_in_month)
+                .map(|d| sm.get(&d).copied().unwrap_or(0))
+                .collect();
+            dec_tail.insert(s.name.clone(), tail);
+        }
+    }
+    jan_mar_parsed.prev_month_tail_shifts = dec_tail;
+
+    // 高橋さんを除外 (宮澤,高橋 のグループ必須ルールで Stage 1 Infeasible にならないことを検証)
+    jan_mar_parsed.staffs.retain(|s| s.name != "高橋");
+
+    let out_path = PathBuf::from("target/test_v1_1_0_jan_mar.xlsx");
+    let _ = fs::remove_file(&out_path);
+    let options = GenerateOptions {
+        target_months: Some(vec![(2027, 1), (2027, 2), (2027, 3)]),
+        output_path: Some(out_path.clone()),
+    };
+
+    let (_, results) =
+        ShiftGenerator::generate(&jan_mar_parsed, &holidays, &options, |_, _, _, _, _| {})
+            .expect("2027年1〜3月の連続生成が成功すること");
+
+    for (y, m, res) in &results {
+        assert!(res.success, "{}年{}月のソルブが成功すること", y, m);
+        assert_eq!(
+            res.stage, 1,
+            "{}年{}月が Stage 2 フォールバックではなく Stage 1 (厳格探索) で解けること",
+            y, m
+        );
+    }
+
+    // 4. 2027年1月の金曜 (1/8, 1/15, 1/22, 1/29) において 小田切・鈴木(孝)・榊原 の3名全員が出勤していること
+    let res_jan = &results[0].2;
+    let fri_group = ["小田切", "鈴木(孝)", "榊原"];
+    for &d in &[8u32, 15, 22, 29] {
+        let count: u8 = fri_group.iter().map(|&name| res_jan.shifts[name][&d]).sum();
+        assert_eq!(
+            count, 3,
+            "2027年1月{}日(金曜)において 小田切・鈴木(孝)・榊原 の3名体制(HIGH1推奨人数3)が達成されていること (実: {}名)",
+            d, count
+        );
+    }
+
+    // 5. 月曜 HARD ルール (田中島・梶原 最小2名) が Stage 1 で厳守されていること (有休等を除く診療月曜)
+    let mon_group = ["田中島", "梶原"];
+    for &d in &ctx_jan.clinic_days {
+        if ctx_jan.weekday_map[&d] == 0 {
+            let date = ctx_jan.date_map[&d];
+            let has_vac = jan_mar_parsed.staffs.iter().any(|s| {
+                mon_group.contains(&s.name.as_str())
+                    && (s.vacation_dates.contains(&date)
+                        || s.special_vacation_dates.contains(&date)
+                        || s.preferred_off_dates.contains(&date)
+                        || s.specified_off_dates.contains(&date))
+            });
+            if !has_vac {
+                let count: u8 = mon_group.iter().map(|&name| res_jan.shifts[name][&d]).sum();
+                assert_eq!(
+                    count, 2,
+                    "2027年1月{}日(月曜)において 田中島・梶原 の2名出勤(HARD)が厳守されていること",
+                    d
+                );
+            }
+        }
+    }
 
     let _ = fs::remove_file(&out_path);
 }

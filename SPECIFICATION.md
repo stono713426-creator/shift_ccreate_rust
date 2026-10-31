@@ -1,6 +1,6 @@
 # 勤務シフト自動生成システム (Rust Edition) 完全移植仕様書
 
-- **Version**: `v1.0.0`
+- **Version**: `v1.1.0`
 - **Last Updated**: `2026-10-31`
 - **移植元リファレンス**: `C:\Users\stono\projects\sift_create` (`v1.9.1`)
 

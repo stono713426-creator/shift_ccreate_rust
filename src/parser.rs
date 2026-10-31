@@ -1,7 +1,8 @@
 //! 勤務シフト自動生成システム Excelデータ解析・日付パーサー (`parser.rs`)
 //!
-//! Version: v1.0.1
-//! Updated: 2026-10-31 - 範囲日付パーサー改修: スペースなしハイフン範囲(例: 2026/11/17-2026/11/21)、年跨ぎ範囲、各種ダッシュ記号に完全対応
+//! Version: v1.1.0
+//! Updated: 2026-10-31 - v1.1.0 パーサー修正: シフト制約条件シートの列ヘッダー検出(適用条件・制限タイプ・所属)修正および除外フラグ大文字小文字対応
+//! - v1.0.1 (2026-10-31): 範囲日付パーサー改修(スペースなしハイフン範囲・年跨ぎ範囲対応)
 //!
 //! SPECIFICATION.md セクション4 に基づく完全移植パーサー。
 
@@ -582,7 +583,11 @@ fn parse_staff_sheet(
         if let Some(c_ex) = col_exclude {
             if row.len() > c_ex {
                 let ex_val = row[c_ex].to_string().trim().to_string();
-                if ex_val == "1" || ex_val == "true" || ex_val == "○" || ex_val == "◯" {
+                if ex_val == "1"
+                    || ex_val.eq_ignore_ascii_case("true")
+                    || ex_val == "○"
+                    || ex_val == "◯"
+                {
                     continue;
                 }
             }
@@ -709,25 +714,32 @@ fn parse_rules_sheet(range: &Range<Data>, rules: &mut Vec<ShiftRule>) {
     for (r_idx, row) in rows.iter().enumerate().take(5) {
         for (c_idx, cell) in row.iter().enumerate() {
             let s = cell.to_string().trim().to_string();
-            if s.contains("ルール") || s.contains("名称") || s.contains("条件") {
-                col_name = Some(c_idx);
-            } else if s.contains("種別") || s.contains("タイプ") || s.contains("区分") {
-                col_type = Some(c_idx);
+            let s_lower = s.to_lowercase();
+            if s.contains("レベル") || s.contains("重要度") || s.contains("優先度") {
+                col_level = Some(c_idx);
             } else if s.contains("対象") || s.contains("スタッフ") {
                 col_staffs = Some(c_idx);
-            } else if s.contains("適用日") || s.contains("日付") || s.contains("曜日") {
-                col_dates = Some(c_idx);
-            } else if s.contains("最低") || s.contains("最小") || s.to_lowercase().contains("min") {
+            } else if s.contains("最低") || s.contains("最小") || s_lower.contains("min") {
                 col_min = Some(c_idx);
-            } else if s.contains("推奨") || s.to_lowercase().contains("rec") {
+            } else if s.contains("推奨") || s_lower.contains("rec") {
                 col_rec = Some(c_idx);
-            } else if s.contains("最大") || s.to_lowercase().contains("max") {
+            } else if s.contains("最大") || s_lower.contains("max") {
                 col_max = Some(c_idx);
-            } else if s.contains("レベル") || s.contains("重要度") || s.contains("優先度") {
-                col_level = Some(c_idx);
+            } else if s.contains("種別") || s.contains("タイプ") || s.contains("区分") || s.contains("制限") {
+                col_type = Some(c_idx);
+            } else if s.contains("適用") || s.contains("日付") || s.contains("曜日") || s == "条件" {
+                col_dates = Some(c_idx);
+            } else if s.contains("ルール") || s.contains("名称") || s.contains("所属") || s.contains("部署") || s.contains("セクション") {
+                col_name = Some(c_idx);
+            } else if s.contains("条件") {
+                if col_dates.is_none() {
+                    col_dates = Some(c_idx);
+                } else if col_name.is_none() {
+                    col_name = Some(c_idx);
+                }
             }
         }
-        if col_name.is_some() && (col_min.is_some() || col_level.is_some()) {
+        if (col_name.is_some() || col_dates.is_some()) && (col_min.is_some() || col_level.is_some()) {
             header_row_idx = r_idx;
             break;
         }

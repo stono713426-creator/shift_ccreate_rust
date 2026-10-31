@@ -1,7 +1,8 @@
 //! 勤務シフト自動生成システム 二段階数理最適化ソルバー (`solver.rs`)
 //!
-//! Version: v1.0.0
-//! Updated: 2026-10-31 - Phase 2 実装: good_lp + HiGHS (MILP) 二段階数理最適化エンジンの完全実装
+//! Version: v1.1.0
+//! Updated: 2026-10-31 - v1.1.0 ソルバー改善: OPE曜日条件評価順・UTF-8スライス修正、除外スタッフ人数補正、OR型主公休スライド柔軟化、固定公休y変数整合化
+//! - v1.0.0 (2026-10-31): Phase 2 実装: good_lp + HiGHS (MILP) 二段階数理最適化エンジンの完全実装
 //!
 //! SPECIFICATION.md セクション5 に基づく厳密な線形不等式モデルと二段階探索の実装。
 
@@ -153,6 +154,35 @@ impl MonthContext {
     }
 }
 
+/// コアスタッフ全員共通の特別有休（年末年始・夏季休診等）の日付集合を算出
+pub fn compute_common_sp_vac(data: &ParsedExcelData, ctx: &MonthContext) -> HashSet<NaiveDate> {
+    let core_staffs: Vec<&Staff> = data
+        .staffs
+        .iter()
+        .filter(|s| s.is_core && s.pattern != "除外")
+        .collect();
+
+    let mut common_sp_vac = HashSet::new();
+    if let Some(first) = core_staffs.first() {
+        common_sp_vac = first
+            .special_vacation_dates
+            .iter()
+            .filter(|d| d.year() == ctx.year && d.month() == ctx.month)
+            .cloned()
+            .collect();
+        for s in core_staffs.iter().skip(1) {
+            let s_vac: HashSet<NaiveDate> = s
+                .special_vacation_dates
+                .iter()
+                .filter(|d| d.year() == ctx.year && d.month() == ctx.month)
+                .cloned()
+                .collect();
+            common_sp_vac = common_sp_vac.intersection(&s_vac).cloned().collect();
+        }
+    }
+    common_sp_vac
+}
+
 /// 5.2 所定勤務日数の計算
 pub fn calculate_target_days(
     data: &ParsedExcelData,
@@ -163,32 +193,7 @@ pub fn calculate_target_days(
     let mut ideal_mean = HashMap::new();
 
     // 1. コアスタッフ全員共通の特別有休 (common_sp_vac)
-    let core_staffs: Vec<&Staff> = data
-        .staffs
-        .iter()
-        .filter(|s| s.is_core && s.pattern != "除外")
-        .collect();
-
-    let mut common_sp_vac = HashSet::new();
-    if !core_staffs.is_empty() {
-        if let Some(first) = core_staffs.first() {
-            common_sp_vac = first
-                .special_vacation_dates
-                .iter()
-                .filter(|d| d.year() == ctx.year && d.month() == ctx.month)
-                .cloned()
-                .collect();
-            for s in core_staffs.iter().skip(1) {
-                let s_vac: HashSet<NaiveDate> = s
-                    .special_vacation_dates
-                    .iter()
-                    .filter(|d| d.year() == ctx.year && d.month() == ctx.month)
-                    .cloned()
-                    .collect();
-                common_sp_vac = common_sp_vac.intersection(&s_vac).cloned().collect();
-            }
-        }
-    }
+    let common_sp_vac = compute_common_sp_vac(data, ctx);
 
     // 2. 共通公休日数
     // common_off_w5: 当月の土曜日のうち、祝日でも common_sp_vac でもない日数
@@ -295,8 +300,12 @@ pub fn calculate_target_days(
         }
     }
 
-    // 4. セクション別理想平均人数 M_s
-    let work_days_len = ctx.clinic_days.len() as f64;
+    // 4. セクション別理想平均人数 M_s (全員共通特別有休の休診日を除いた実稼働日数で算出)
+    let work_days_len = ctx
+        .clinic_days
+        .iter()
+        .filter(|&&d| !common_sp_vac.contains(&ctx.date_map[&d]))
+        .count() as f64;
     if work_days_len > 0.0 {
         let sum_1f: i32 = data
             .staffs
@@ -333,6 +342,7 @@ pub fn parse_rule_target_dates(
     ope_dict: &HashMap<NaiveDate, String>,
 ) -> Vec<u32> {
     let desc_trim = desc.trim();
+    let desc_lower = desc_trim.to_lowercase();
     let mut target_days = Vec::new();
 
     let day_filter = |target_w: u32| -> Vec<u32> {
@@ -345,18 +355,6 @@ pub fn parse_rule_target_dates(
 
     if desc_trim.contains("全日") {
         target_days = ctx.clinic_days.clone();
-    } else if desc_trim.contains("月曜") {
-        target_days = day_filter(0);
-    } else if desc_trim.contains("火曜") {
-        target_days = day_filter(1);
-    } else if desc_trim.contains("水曜") {
-        target_days = day_filter(2);
-    } else if desc_trim.contains("木曜") {
-        target_days = day_filter(3);
-    } else if desc_trim.contains("金曜") {
-        target_days = day_filter(4);
-    } else if desc_trim.contains("土曜") {
-        target_days = day_filter(5);
     } else if desc_trim.contains("手術のある日") || desc_trim.contains("日曜日以外の手術のある日") {
         target_days = ctx
             .clinic_days
@@ -364,8 +362,8 @@ pub fn parse_rule_target_dates(
             .filter(|&&d| ope_dict.contains_key(&ctx.date_map[&d]))
             .cloned()
             .collect();
-    } else if desc_trim.contains("手術") || desc_trim.contains("OPE") || desc_trim.contains("オペ") {
-        // 先頭の曜日指定があるか判定
+    } else if desc_trim.contains("手術") || desc_lower.contains("ope") || desc_trim.contains("オペ") {
+        // 先頭の曜日指定があるか判定 (例: "火曜(OPE日)", "水曜(OPE日)")
         let base_days = if desc_trim.contains("月曜") {
             day_filter(0)
         } else if desc_trim.contains("火曜") {
@@ -382,35 +380,61 @@ pub fn parse_rule_target_dates(
             ctx.clinic_days.clone()
         };
 
-        // キーワード抽出: 「...」または部分一致
+        // キーワード抽出: 「...」または部分一致 (UTF-8 文字境界安全)
         let mut kw = String::new();
         if let Some(start) = desc_trim.find('「') {
-            if let Some(end) = desc_trim.find('」') {
-                if start < end {
-                    kw = desc_trim[start + 1..end].to_string();
-                }
+            let content_start = start + '「'.len_utf8();
+            if let Some(rel_end) = desc_trim[content_start..].find('」') {
+                kw = desc_trim[content_start..content_start + rel_end].trim().to_string();
             }
         }
         if kw.is_empty() {
-            if desc_trim.contains("硝子体") || desc_trim.to_lowercase().contains("vit") {
-                kw = "硝子体".to_string();
+            if desc_trim.contains("硝子体") || desc_lower.contains("vit") {
+                kw = "vit".to_string();
             } else if desc_trim.contains("下垂") || desc_trim.contains("眼瞼") {
                 kw = "下垂".to_string();
-            } else if desc_trim.contains("白内障") || desc_trim.to_lowercase().contains("cat") {
-                kw = "白内障".to_string();
-            } else if desc_trim.contains("緑内障") || desc_trim.to_lowercase().contains("gla") {
-                kw = "緑内障".to_string();
+            } else if desc_trim.contains("白内障") || desc_lower.contains("cat") {
+                kw = "cat".to_string();
+            } else if desc_trim.contains("緑内障") || desc_lower.contains("gla") {
+                kw = "gla".to_string();
             }
         }
 
+        let kw_lower = kw.to_lowercase();
         for d in base_days {
             let date = ctx.date_map[&d];
             if let Some(ope_text) = ope_dict.get(&date) {
-                if kw.is_empty() || ope_text.contains(&kw) {
+                let ope_lower = ope_text.to_lowercase();
+                let matched = if kw.is_empty() {
+                    true
+                } else if kw_lower == "vit" || kw == "硝子体" {
+                    ope_lower.contains("vit") || ope_text.contains("硝子体")
+                } else if kw_lower == "cat" || kw == "白内障" {
+                    ope_lower.contains("cat") || ope_text.contains("白内障")
+                } else if kw_lower == "gla" || kw == "緑内障" {
+                    ope_lower.contains("gla") || ope_text.contains("緑内障")
+                } else if kw == "下垂" || kw == "眼瞼" || kw == "眼瞼下垂" {
+                    ope_text.contains("下垂") || ope_text.contains("眼瞼")
+                } else {
+                    ope_lower.contains(&kw_lower)
+                };
+                if matched {
                     target_days.push(d);
                 }
             }
         }
+    } else if desc_trim.contains("月曜") {
+        target_days = day_filter(0);
+    } else if desc_trim.contains("火曜") {
+        target_days = day_filter(1);
+    } else if desc_trim.contains("水曜") {
+        target_days = day_filter(2);
+    } else if desc_trim.contains("木曜") {
+        target_days = day_filter(3);
+    } else if desc_trim.contains("金曜") {
+        target_days = day_filter(4);
+    } else if desc_trim.contains("土曜") {
+        target_days = day_filter(5);
     } else {
         target_days = ctx.clinic_days.clone();
     }
@@ -601,16 +625,19 @@ fn build_and_solve_stage(
                 }
             }
 
-            // 各 ISO 週において、指定公休を含まない週なら、診療日 d (w in C) に対し x[s, d] + y[s, w] <= 1
+            // 各 ISO 週において、指定公休を含まない週なら原則として第2公休曜日は休み:
+            // x[s, d] + y[s, w] - slide_slack <= 1.0 (5週ある曜日等で所定日数 target と衝突する週のみ1日スライド/免除を許容)
             for week in &ctx.weeks {
                 let week_has_spec_off = week.days.iter().any(|&d| staff.specified_off_dates.contains(&ctx.date_map[&d]));
                 if !week_has_spec_off {
                     for &d in &week.clinic_days {
                         let w = ctx.weekday_map[&d];
                         if candidates.contains(&w) {
+                            let slide_slack = vars.add(variable().min(0.0));
                             constraints.push(constraint!(
-                                x_vars[&(s_name.clone(), d)] + y_vars[&(s_name.clone(), w)] <= 1.0
+                                x_vars[&(s_name.clone(), d)] + y_vars[&(s_name.clone(), w)] - slide_slack <= 1.0
                             ));
+                            objective += slide_slack * WEIGHT_MAIN_OFF_SLIDE_SLACK as f64;
                         }
                     }
                 }
@@ -632,6 +659,15 @@ fn build_and_solve_stage(
                 let w = ctx.weekday_map[&d];
                 if staff.basic_off_days.contains(&w) {
                     constraints.push(constraint!(x_vars[&(s_name.clone(), d)] == 0.0));
+                }
+            }
+
+            // y_vars を固定公休曜日に一致させる（主公休不一致ペナルティのすり抜け防止）
+            for w in 0..=5 {
+                if staff.basic_off_days.contains(&w) {
+                    constraints.push(constraint!(y_vars[&(s_name.clone(), w)] == 1.0));
+                } else {
+                    constraints.push(constraint!(y_vars[&(s_name.clone(), w)] == 0.0));
                 }
             }
 
@@ -671,16 +707,19 @@ fn build_and_solve_stage(
                 }
             }
 
-            // 各 ISO 週において、指定公休を含まない週なら主公休曜日は休み: x[s, d] + y[s, w] <= 1
+            // 各 ISO 週において、指定公休を含まない週なら原則として主公休曜日は休み:
+            // x[s, d] + y[s, w] - slide_slack <= 1.0 (HIGH1/HIGH2等の高優先制約と競合する週のみ一時スライドを許容)
             for week in &ctx.weeks {
                 let week_has_spec_off = week.days.iter().any(|&d| staff.specified_off_dates.contains(&ctx.date_map[&d]));
                 if !week_has_spec_off {
                     for &d in &week.clinic_days {
                         let w = ctx.weekday_map[&d];
                         if candidates.contains(&w) {
+                            let slide_slack = vars.add(variable().min(0.0));
                             constraints.push(constraint!(
-                                x_vars[&(s_name.clone(), d)] + y_vars[&(s_name.clone(), w)] <= 1.0
+                                x_vars[&(s_name.clone(), d)] + y_vars[&(s_name.clone(), w)] - slide_slack <= 1.0
                             ));
+                            objective += slide_slack * WEIGHT_MAIN_OFF_SLIDE_SLACK as f64;
                         }
                     }
                 }
@@ -786,15 +825,20 @@ fn build_and_solve_stage(
                 }
             }
 
-            // 過去主公休ローテーションペナルティ (前月実績からの主公休引き継ぎ抑制)
-            if let Some(&prev_w) = data.prev_month_main_offs.get(s_name) {
-                if prev_w <= 5 {
-                    let rot_weight = if is_week4_fixed_one {
-                        WEIGHT_PREV_OFF_REPEAT * 40 // 12,000,000
-                    } else {
-                        WEIGHT_PREV_OFF_REPEAT * 4 // 1,200,000
-                    };
-                    objective += y_vars[&(s_name.clone(), prev_w)] * rot_weight as f64;
+            // 過去主公休ローテーションペナルティ (前月実績からの主公休引き継ぎ抑制: AND固定公休者は対象外)
+            let is_pure_fixed_and = staff.basic_off_type == OffType::And
+                && !staff.basic_off_days.is_empty()
+                && !is_week4_fixed_one;
+            if !is_pure_fixed_and {
+                if let Some(&prev_w) = data.prev_month_main_offs.get(s_name) {
+                    if prev_w <= 5 {
+                        let rot_weight = if is_week4_fixed_one {
+                            WEIGHT_PREV_OFF_REPEAT * 40 // 12,000,000
+                        } else {
+                            WEIGHT_PREV_OFF_REPEAT * 4 // 1,200,000
+                        };
+                        objective += y_vars[&(s_name.clone(), prev_w)] * rot_weight as f64;
+                    }
                 }
             }
         }
@@ -837,8 +881,13 @@ fn build_and_solve_stage(
         }
     }
 
-    // 9. セクション出勤人数の平準化とペナルティ
+    // 9. セクション出勤人数の平準化とペナルティ (全員共通特別有休の休診日は除外)
+    let common_sp_vac = compute_common_sp_vac(data, ctx);
     for &d in &ctx.clinic_days {
+        let date = ctx.date_map[&d];
+        if common_sp_vac.contains(&date) {
+            continue;
+        }
         // 1階
         let sum_1f: Expression = data
             .staffs
@@ -925,22 +974,37 @@ fn build_and_solve_stage(
         }
 
         // 2階裏 看護師人数制約
-        let num_nurses = core_2f_back.iter().filter(|s| s.role.contains("看護師")).count();
+        let nurses_2f_back: Vec<&&Staff> = core_2f_back
+            .iter()
+            .filter(|s| s.role.contains("看護師"))
+            .collect();
+        let num_nurses = nurses_2f_back.len();
         if num_nurses > 0 {
-            let sum_nurses: Expression = core_2f_back
+            let sum_nurses: Expression = nurses_2f_back
                 .iter()
-                .filter(|s| s.role.contains("看護師"))
                 .map(|s| x_vars[&(s.name.clone(), d)])
                 .sum();
 
-            // 看護師最低人数 (nurse_min_count = 1)
-            let eff_nurse_min = (config.nurse_min_count as usize).min(num_nurses) as f64;
-            if stage == 1 {
-                constraints.push(constraint!(sum_nurses.clone() >= eff_nurse_min));
-            } else {
-                let n_slack = vars.add(variable().min(0.0));
-                constraints.push(constraint!(sum_nurses.clone() + n_slack >= eff_nurse_min));
-                objective += n_slack * WEIGHT_NURSE_DEFICIT_SLACK as f64;
+            let avail_nurses = nurses_2f_back
+                .iter()
+                .filter(|s| {
+                    !s.vacation_dates.contains(&date)
+                        && !s.special_vacation_dates.contains(&date)
+                        && !s.preferred_off_dates.contains(&date)
+                        && !(config.specified_off_rule && s.specified_off_dates.contains(&date))
+                })
+                .count();
+
+            // 看護師最低人数 (nurse_min_count = 1、全員休暇等で物理的に0名の日は上限クランプ)
+            let eff_nurse_min = (config.nurse_min_count as usize).min(avail_nurses) as f64;
+            if eff_nurse_min > 0.0 {
+                if stage == 1 {
+                    constraints.push(constraint!(sum_nurses.clone() >= eff_nurse_min));
+                } else {
+                    let n_slack = vars.add(variable().min(0.0));
+                    constraints.push(constraint!(sum_nurses.clone() + n_slack >= eff_nurse_min));
+                    objective += n_slack * WEIGHT_NURSE_DEFICIT_SLACK as f64;
+                }
             }
 
             // 看護師推奨人数 (nurse_rec_count = 2)
@@ -952,7 +1016,7 @@ fn build_and_solve_stage(
         }
     }
 
-    // 2階裏 通常週（祝日を含まない6診療日の週）の4名体制最低日数制約
+    // 2階裏 通常週（祝日・共通特別有休を含まない6稼働日の週）の4名体制最低日数制約
     let core_2f_back_names: Vec<String> = data
         .staffs
         .iter()
@@ -961,10 +1025,16 @@ fn build_and_solve_stage(
         .collect();
 
     for week in &ctx.weeks {
-        if !week.has_holiday && week.clinic_days.len() == 6 {
-            // 各診療日 d について、4名以上出勤フラグ is_4plus を定義
+        let active_clinic_days: Vec<u32> = week
+            .clinic_days
+            .iter()
+            .copied()
+            .filter(|&d| !common_sp_vac.contains(&ctx.date_map[&d]))
+            .collect();
+        if !week.has_holiday && active_clinic_days.len() == 6 {
+            // 各稼働日 d について、4名以上出勤フラグ is_4plus を定義
             let mut is_4plus_sum = Expression::from(0.0);
-            for &d in &week.clinic_days {
+            for &d in &active_clinic_days {
                 let is_4plus = vars.add(variable().binary());
                 let sum_day: Expression = core_2f_back_names
                     .iter()
@@ -1004,35 +1074,69 @@ fn build_and_solve_stage(
             continue;
         }
 
+        let original_count = rule.target_staffs.len() as i32;
+        let valid_count = target_staffs.len() as i32;
+        let excluded_count = (original_count - valid_count).max(0);
+
         let is_simultaneous_off = rule.rule_type.contains("同時休み") || rule.name.contains("同時休み");
-        let eff_min = if is_simultaneous_off {
-            rule.val_min.max(target_staffs.len() as i32 - rule.val_min)
+        let base_min = if is_simultaneous_off {
+            rule.val_min.max(original_count - rule.val_min)
         } else {
             rule.val_min
         };
+        let eff_min = (base_min - excluded_count).max(0);
+        let eff_rec = (rule.val_rec - excluded_count).max(0);
 
         let is_hard = rule.level.to_uppercase().contains("HARD");
         let weight = get_level_weight(&rule.level) as f64;
         let rec_weight = get_rec_weight(&rule.level) as f64;
 
         for &d in &target_days {
+            let date = ctx.date_map[&d];
+            if common_sp_vac.contains(&date) {
+                continue;
+            }
+
+            // 当日に確定休暇(有休・特有・希望休・指定公休・AND固定公休)で x=0 がハード固定されていない最大出勤可能人数
+            let w = ctx.weekday_map[&d];
+            let avail_on_d = target_staffs
+                .iter()
+                .filter(|&name| {
+                    if let Some(st) = data.staffs.iter().find(|s| &s.name == name) {
+                        let forced_vac = st.vacation_dates.contains(&date)
+                            || st.special_vacation_dates.contains(&date)
+                            || st.preferred_off_dates.contains(&date)
+                            || (config.specified_off_rule && st.specified_off_dates.contains(&date));
+                        let forced_basic = (st.basic_off_type == OffType::And || !st.is_core)
+                            && st.basic_off_days.contains(&w);
+                        !forced_vac && !forced_basic
+                    } else {
+                        false
+                    }
+                })
+                .count() as i32;
+
+            let day_eff_min = eff_min.min(avail_on_d);
+
             let sum_target: Expression = target_staffs
                 .iter()
                 .map(|name| x_vars[&(name.clone(), d)])
                 .sum();
 
-            if is_hard && stage == 1 {
-                constraints.push(constraint!(sum_target.clone() >= eff_min as f64));
-            } else {
-                let slack = vars.add(variable().min(0.0));
-                constraints.push(constraint!(sum_target.clone() + slack >= eff_min as f64));
-                objective += slack * weight;
+            if day_eff_min > 0 {
+                if is_hard && stage == 1 {
+                    constraints.push(constraint!(sum_target.clone() >= day_eff_min as f64));
+                } else {
+                    let slack = vars.add(variable().min(0.0));
+                    constraints.push(constraint!(sum_target.clone() + slack >= day_eff_min as f64));
+                    objective += slack * weight;
+                }
             }
 
-            // 推奨人数 (val_rec > eff_min)
-            if rule.val_rec > eff_min {
+            // 推奨人数 (eff_rec > day_eff_min)
+            if eff_rec > day_eff_min {
                 let rec_slack = vars.add(variable().min(0.0));
-                constraints.push(constraint!(sum_target.clone() + rec_slack >= rule.val_rec as f64));
+                constraints.push(constraint!(sum_target.clone() + rec_slack >= eff_rec as f64));
                 objective += rec_slack * rec_weight;
             }
 
@@ -1108,7 +1212,14 @@ fn build_and_solve_stage(
                 }
                 shifts.insert(s_name.clone(), day_map);
 
-                if staff.is_core && staff.pattern != "除外" {
+                let is_week4_fixed_one = staff.pattern.contains("週4")
+                    && staff.basic_off_days.len() == 1
+                    && staff.basic_off_type == OffType::And;
+                let is_pure_fixed_and = staff.basic_off_type == OffType::And
+                    && !staff.basic_off_days.is_empty()
+                    && !is_week4_fixed_one;
+
+                if staff.is_core && staff.pattern != "除外" && !is_pure_fixed_and {
                     let mut best_w = 0;
                     let mut max_val = -1.0;
                     for w in 0..=5 {

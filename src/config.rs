@@ -1,7 +1,8 @@
 //! 勤務シフト自動生成システム 設定モジュール (`config.rs`)
 //!
-//! Version: v1.0.0
-//! Updated: 2026-10-31 - Phase 1 初期実装: 10段階制約重み、固定ペナルティ、ShiftConfig (全15項目)
+//! Version: v1.1.0
+//! Updated: 2026-10-31 - v1.1.0 優先度階層強化: HIGH1推奨人数ペナルティ引き上げ(10M)および主公休スライド許容スラック重み追加
+//! - v1.0.0 (2026-10-31): Phase 1 初期実装: 10段階制約重み、固定ペナルティ、ShiftConfig (全15項目)
 //!
 //! SPECIFICATION.md セクション2 に基づく定数・ペナルティ重み・動的設定の完全実装。
 
@@ -52,10 +53,10 @@ pub fn get_level_weight(level: &str) -> i64 {
 // ============================================================================
 // 2.2 推奨人数 (val_rec) 不足ペナルティ重み
 // ============================================================================
-pub const REC_WEIGHT_HARD1: i64 = 6_000_000;
-pub const REC_WEIGHT_HARD2: i64 = 5_000_000;
-pub const REC_WEIGHT_HARD3: i64 = 4_000_000;
-pub const REC_WEIGHT_HIGH1: i64 = 6_000_000;
+pub const REC_WEIGHT_HARD1: i64 = 12_000_000;
+pub const REC_WEIGHT_HARD2: i64 = 11_000_000;
+pub const REC_WEIGHT_HARD3: i64 = 10_500_000;
+pub const REC_WEIGHT_HIGH1: i64 = 10_000_000;
 pub const REC_WEIGHT_HIGH2: i64 = 4_000_000;
 pub const REC_WEIGHT_HIGH3: i64 = 2_000_000;
 pub const REC_WEIGHT_SOFT1: i64 = 400_000;
@@ -108,6 +109,8 @@ pub const WEIGHT_SUBSTITUTE_OFF_SLACK: i64 = 8_000_000;
 pub const WEIGHT_2F_BACK_WEEKLY_4_SLACK: i64 = 5_000_000;
 /// 2階裏 5名出勤ペナルティ
 pub const WEIGHT_2F_BACK_5_PENALTY: i64 = 2_000_000;
+/// OR型スタッフの週次主公休曜日スライド許容ペナルティ（HIGH1/HIGH2推奨人数達成時に主公休の一時移動を許容）
+pub const WEIGHT_MAIN_OFF_SLIDE_SLACK: i64 = 2_000_000;
 /// 1階 `M_s >= 6.5` のとき 6名以下となるペナルティ
 pub const WEIGHT_1F_UNDER_7_PENALTY: i64 = 1_500_000;
 /// セクション人数平準化（2乗項）
@@ -356,8 +359,12 @@ mod tests {
 
     #[test]
     fn test_rec_weights() {
-        assert_eq!(get_rec_weight("HARD1"), 6_000_000);
-        assert_eq!(get_rec_weight("HARD"), 5_000_000);
+        assert_eq!(get_rec_weight("HARD1"), 12_000_000);
+        assert_eq!(get_rec_weight("HARD"), 11_000_000);
+        assert_eq!(get_rec_weight("HARD3"), 10_500_000);
+        assert_eq!(get_rec_weight("HIGH1"), 10_000_000);
+        assert_eq!(get_rec_weight("HIGH2"), 4_000_000);
+        assert!(get_rec_weight("HIGH1") > get_level_weight("HIGH2"));
         assert_eq!(get_rec_weight("SOFT2"), 200_000);
         assert_eq!(get_rec_weight("LOW"), 50_000);
     }
