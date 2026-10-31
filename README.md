@@ -12,7 +12,7 @@
 詳細な移植仕様・数式・書式定義はすべて [SPECIFICATION.md](./SPECIFICATION.md) に記載されています。
 
 - [x] **初期セットアップ**: プロジェクト構成、Git 初期化、Windows `.exe` バージョン情報自動埋め込み (`build.rs`)、完全移植仕様書 (`SPECIFICATION.md`) 策定
-- [ ] **Phase 1**: 設定 (`config.rs`)・祝日計算 (`holidays.rs`)・Excel 全シート＆NFKC日付パーサー (`parser.rs`) の実装と実データ読込テスト
+- [x] **Phase 1**: 設定 (`config.rs`)・祝日計算 (`holidays.rs`)・Excel 全シート＆NFKC日付パーサー (`parser.rs`) の実装と実データ読込テスト
 - [ ] **Phase 2**: 二段階数理最適化ソルバー (`solver.rs` / `good_lp` + `highs`) の実装と全7項目の回帰テスト合格
 - [ ] **Phase 3**: 現場フォーマット Excel 描画 (`renderer.rs` / `rust_xlsxwriter`)・複数月連続生成サービス (`generator.rs`)・CLI 対応
 - [ ] **Phase 4**: モダンデスクトップ GUI (`gui.rs` / `eframe`)・単体 `.exe` リリースビルド・配布 ZIP パッケージング
