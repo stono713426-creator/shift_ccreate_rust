@@ -1,7 +1,7 @@
 //! 勤務シフト自動生成システム 7大統合回帰テストスイート (`tests/regression_suite.rs`)
 //!
-//! Version: v1.0.0
-//! Updated: 2026-10-31 - Phase 2 実装:
+//! Version: v1.0.1
+//! Updated: 2026-10-31 - Patch 修正: test_10 小島さん11月特別有休パース・反映・Excel出力検証追加
 //! - test_01_holidays: 祝日計算・春分秋分・国民の休日・振替休日検証
 //! - test_02_date_parser_and_specified_off: 日付パーサー・NFKC・指定公休HARD固定＆ISO週義務免除検証
 //! - test_03_substitute_off_in_holiday_week: 祝日と固定公休曜日重複時の振替公休自動設定検証
@@ -122,6 +122,14 @@ fn test_02_date_parser_and_specified_off() {
     assert!(dates.contains(&NaiveDate::from_ymd_opt(2024, 9, 3).unwrap()));
     assert!(dates.contains(&NaiveDate::from_ymd_opt(2024, 9, 10).unwrap()));
     assert_eq!(dates.len(), 4);
+
+    // (2-B) ハイフンによる範囲指定 (スペースなし: "2026/11/17-2026/11/21,2026/12/29-2027/01/04")
+    let cell_hyphen_range = calamine::Data::String("2026/11/17-2026/11/21,2026/12/29-2027/01/04".to_string());
+    let dates_hyphen = parse_date_list(&cell_hyphen_range, 2026, None);
+    println!("dates_hyphen parsed: {:?}", dates_hyphen);
+    assert!(dates_hyphen.contains(&NaiveDate::from_ymd_opt(2026, 11, 17).unwrap()), "11/17が含まれること");
+    assert!(dates_hyphen.contains(&NaiveDate::from_ymd_opt(2026, 11, 21).unwrap()), "11/21が含まれること");
+    assert_eq!(dates_hyphen.len(), 5 + 7);
 
     // (3) 日曜日・祝日除外フィルタの検証
     let cell_with_holidays = calamine::Data::String("9/15, 9/16, 9/17".to_string());
@@ -413,12 +421,6 @@ fn test_08_renderer_excel_output() {
     let _ = fs::remove_file(&out_path);
 }
 
-
-
-
-
-
-
 // ============================================================================
 // 9. test_09_multi_month_continuous_generation: ShiftGenerator 連続生成＆月跨ぎ引き継ぎ検証 (Phase 3)
 // ============================================================================
@@ -458,6 +460,97 @@ fn test_09_multi_month_continuous_generation() {
     assert!(sheets.contains(&"2026年10月シフト".to_string()), "10月シートが存在すること");
 
     // テスト後の一時ファイル削除
+    let _ = fs::remove_file(&out_path);
+}
+
+// ============================================================================
+// 10. test_10_kojima_november_special_vacation: 小島さんの11/17-11/21特別有休反映検証
+// ============================================================================
+#[test]
+fn test_10_kojima_november_special_vacation() {
+    let (parsed, holidays) = load_test_excel();
+
+    // 1. パース結果における小島さんの特別有休と指定公休の保持検証
+    let kojima = parsed
+        .staffs
+        .iter()
+        .find(|s| s.name == "小島")
+        .expect("小島さんがスタッフマスタに存在すること");
+
+    println!("小島さんの特別有休一覧: {:?}", kojima.special_vacation_dates);
+    for d in 17..=21 {
+        let date = NaiveDate::from_ymd_opt(2026, 11, d).unwrap();
+        assert!(
+            kojima.special_vacation_dates.contains(&date),
+            "11/{} が小島さんの特別有休に含まれていること",
+            d
+        );
+    }
+    let spec_date = NaiveDate::from_ymd_opt(2026, 11, 16).unwrap();
+    assert!(
+        kojima.specified_off_dates.contains(&spec_date),
+        "11/16 が小島さんの指定公休に含まれていること"
+    );
+
+    // 2. 2026年11月シフト生成
+    let res = solve_shift(&parsed, 2026, 11, &holidays);
+    assert!(res.success, "2026年11月のシフト生成が成功すること");
+
+    let kojima_shifts = res.shifts.get("小島").expect("小島さんのシフトが存在すること");
+    for d in 17..=21 {
+        assert_eq!(
+            kojima_shifts.get(&d),
+            Some(&0),
+            "特別有休期間中の 11/{} は確実に休み (0) であること",
+            d
+        );
+    }
+    assert_eq!(
+        kojima_shifts.get(&16),
+        Some(&0),
+        "指定公休日の 11/16 は確実に休み (0) であること"
+    );
+
+    // 3. Excel レンダリングで「特有」表記が正しく出力されることの検証
+    let out_path = PathBuf::from("target/test_kojima_nov_shift.xlsx");
+    let _ = fs::remove_file(&out_path);
+
+    let render_res = render_shifts_to_file(&out_path, &parsed, &[(2026, 11, res)], &holidays);
+    assert!(render_res.is_ok(), "Excel出力が成功すること: {:?}", render_res.err());
+
+    let mut workbook = open_workbook_auto(&out_path).expect("出力Excelが開けること");
+    let range = workbook
+        .worksheet_range("2026年11月シフト")
+        .expect("11月シフトシートが存在すること");
+    let rows: Vec<Vec<calamine::Data>> = range.rows().map(|r| r.to_vec()).collect();
+
+    // 2行目のスタッフ名から小島さんの列インデックスを特定 (行0はタイトル行、行1がヘッダー行)
+    let staff_row = &rows[1];
+    let mut kojima_col = None;
+    for (col_idx, cell) in staff_row.iter().enumerate() {
+        if cell.to_string().trim() == "小島" {
+            kojima_col = Some(col_idx);
+            break;
+        }
+    }
+    let k_col = kojima_col.expect("ヘッダー行に小島さんが見つかること");
+
+    // 日付1日は row[2], 16日は row[17], 17日は row[18], 21日は row[22]
+    // 11/17〜11/21 が "特有" と出力されていること
+    for d in 17..=21 {
+        let row_idx = d + 1; // 1日はrow[2] -> d日は row[d+1]
+        let cell_val = rows[row_idx as usize][k_col].to_string();
+        assert_eq!(
+            cell_val, "特有",
+            "11/{} の小島さんのセル表記は '特有' であること (実際: {})",
+            d, cell_val
+        );
+    }
+
+    // 11/16 の指定公休は "公" と出力されていること
+    let cell_nov16 = rows[17][k_col].to_string();
+    assert_eq!(cell_nov16, "公", "11/16 の小島さんのセル表記は '公' であること");
+
     let _ = fs::remove_file(&out_path);
 }
 

@@ -1,7 +1,7 @@
 //! 勤務シフト自動生成システム Excelデータ解析・日付パーサー (`parser.rs`)
 //!
-//! Version: v1.0.0
-//! Updated: 2026-10-31 - Phase 1 初期実装: NFKC正規化日付パース、全シート（マスタ・制約・OPE・前月実績・設定・既存シフト）読込
+//! Version: v1.0.1
+//! Updated: 2026-10-31 - 範囲日付パーサー改修: スペースなしハイフン範囲(例: 2026/11/17-2026/11/21)、年跨ぎ範囲、各種ダッシュ記号に完全対応
 //!
 //! SPECIFICATION.md セクション4 に基づく完全移植パーサー。
 
@@ -136,68 +136,102 @@ pub fn parse_date_list(
                 }
             }
 
-            // 5. 時刻表記除去 (\b\d{1,2}:\d{2}(:\d{2})?\b)
+            // 5. 時刻表記除去 (\b\d{1,2}:\d{2}(:\d{2})?\b) および 曜日表記除去 (例: (月), （火）)
             let re_time = Regex::new(r"\b\d{1,2}:\d{2}(:\d{2})?\b").unwrap();
-            let cleaned = re_time.replace_all(trimmed, "");
+            let cleaned_time = re_time.replace_all(trimmed, "");
+            let re_weekday = Regex::new(r"[\(（][月火水木金土日][\)）]").unwrap();
+            let cleaned = re_weekday.replace_all(&cleaned_time, "");
 
             // 記号 [,、;・\n\r]+ でトークン分割
             let re_split = Regex::new(r"[,、;・\n\r]+").unwrap();
-            let raw_tokens: Vec<&str> = re_split.split(&cleaned).map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
-
-            // 範囲記号 ([-〜~]) を含まない空白区切りトークンは空白で再分割
-            let mut tokens = Vec::new();
-            for tok in raw_tokens {
-                if tok.contains('〜') || tok.contains('~') || tok.contains(" - ") {
-                    tokens.push(tok.to_string());
-                } else {
-                    for part in tok.split_whitespace() {
-                        if !part.is_empty() {
-                            tokens.push(part.to_string());
-                        }
-                    }
-                }
-            }
+            let raw_tokens: Vec<&str> = re_split
+                .split(&cleaned)
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect();
 
             // 各トークンの日付・範囲パース
-            for tok in tokens {
-                if tok.contains('〜') || tok.contains('~') || tok.contains(" - ") {
-                    // 範囲パース
-                    let delimiter = if tok.contains('〜') {
-                        '〜'
-                    } else if tok.contains('~') {
-                        '~'
-                    } else {
-                        '-'
-                    };
-                    let parts: Vec<&str> = if delimiter == '-' {
-                        tok.split(" - ").collect()
-                    } else {
-                        tok.split(delimiter).collect()
-                    };
-
-                    if parts.len() == 2 {
-                        let d1 = parse_single_date(parts[0], default_year);
-                        let d2 = parse_single_date(parts[1], default_year);
-                        if let (Some(mut start), Some(mut end)) = (d1, d2) {
-                            if start > end {
-                                std::mem::swap(&mut start, &mut end);
-                            }
-                            let mut curr = start;
-                            while curr <= end {
-                                dates.insert(curr);
-                                curr += Duration::days(1);
-                            }
-                        }
-                    }
-                } else if let Some(d) = parse_single_date(&tok, default_year) {
-                    dates.insert(d);
-                }
+            for tok in raw_tokens {
+                parse_date_token(tok, default_year, &mut dates);
             }
         }
         _ => {}
     }
 
     filter_holidays_sundays(dates, holidays_jp_dict)
+}
+
+/// トークン文字列から日付範囲または単一日付を抽出し dates に追加
+fn parse_date_token(
+    tok: &str,
+    default_year: i32,
+    dates: &mut HashSet<NaiveDate>,
+) {
+    // 範囲表現正規表現:
+    // 開始日付: YYYY/M/D または M/D (区切りは / または . または -)
+    // 範囲記号: 〜, ~, ～, ー, ―, –, —, またはハイフン - (前後の空白許容)
+    // 終了日付: YYYY/M/D または M/D (区切りは / または . または -)
+    let re_range = Regex::new(
+        r"(\d{2,4}[/.-]\d{1,2}[/.-]\d{1,2}|\d{1,2}[/.-]\d{1,2})\s*(?:[〜~～ー―–—-]|-\s*)\s*(\d{2,4}[/.-]\d{1,2}[/.-]\d{1,2}|\d{1,2}[/.-]\d{1,2})"
+    ).unwrap();
+
+    let mut remaining = tok.to_string();
+
+    for cap in re_range.captures_iter(tok) {
+        let whole_match = cap.get(0).unwrap();
+        let s1 = cap.get(1).unwrap().as_str();
+        let s2 = cap.get(2).unwrap().as_str();
+
+        let d1 = parse_single_date(s1, default_year);
+        // 開始日に年が明記されていれば終了日のデフォルト年として引き継ぐ
+        let year_for_d2 = d1.map(|d| d.year()).unwrap_or(default_year);
+        let d2 = parse_single_date(s2, year_for_d2);
+
+        if let (Some(mut start), Some(mut end)) = (d1, d2) {
+            // 年跨ぎ補正 (例: 12/29 - 1/4)
+            if !has_explicit_year(s2) && end < start && end.month() < start.month() {
+                if let Some(next_year_end) = NaiveDate::from_ymd_opt(start.year() + 1, end.month(), end.day()) {
+                    end = next_year_end;
+                }
+            }
+
+            if start > end {
+                std::mem::swap(&mut start, &mut end);
+            }
+
+            let days_diff = (end - start).num_days();
+            if days_diff <= 100 {
+                let mut curr = start;
+                while curr <= end {
+                    dates.insert(curr);
+                    curr += Duration::days(1);
+                }
+            }
+        }
+        remaining = remaining.replace(whole_match.as_str(), " ");
+    }
+
+    // 残りの文字列から単一日付をパース (空白区切り)
+    for part in remaining.split_whitespace() {
+        if let Some(d) = parse_single_date(part, default_year) {
+            dates.insert(d);
+        }
+    }
+}
+
+/// 日付文字列に年情報が明示されているか判定 (パーツ数が3つ以上: YYYY/M/D 等)
+fn has_explicit_year(s: &str) -> bool {
+    let cleaned = s
+        .replace('年', "/")
+        .replace('月', "/")
+        .replace('.', "/")
+        .replace('日', "");
+    let parts: Vec<&str> = cleaned
+        .split(['/', '-'])
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty())
+        .collect();
+    parts.len() >= 3
 }
 
 /// 単一の日付文字列をパース
