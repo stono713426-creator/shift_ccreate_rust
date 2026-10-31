@@ -1,0 +1,38 @@
+[package]
+name = "shift_create_rust"
+version = "1.0.0"
+edition = "2021"
+description = "勤務シフト自動生成システム (純Rustネイティブ版)"
+authors = ["Antigravity"]
+
+[lib]
+name = "shift_core"
+path = "src/lib.rs"
+
+[[bin]]
+name = "shift_create_rust"
+path = "src/main.rs"
+
+[dependencies]
+# Phase 1〜4 の実装進行に合わせて順次有効化・導入する予定クレート:
+# - Phase 1 (日付・正規化・Excel読込・祝日API):
+#   chrono = "0.4"
+#   calamine = "0.26"
+#   unicode-normalization = "0.1"
+#   regex = "1"
+#   reqwest = { version = "0.12", features = ["blocking", "json", "rustls-tls"], default-features = false }
+#   serde = { version = "1", features = ["derive"] }
+#   serde_json = "1"
+# - Phase 2 (二段階数理最適化 MILP ソルバー):
+#   good_lp = { version = "1", features = ["highs"], default-features = false }
+# - Phase 3 (現場フォーマット Excel 出力):
+#   rust_xlsxwriter = "0.80"
+# - Phase 4 (モダンデスクトップ GUI):
+#   eframe = "0.31"
+#   rfd = "0.15"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
