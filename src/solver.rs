@@ -617,7 +617,15 @@ fn build_and_solve_stage(
             }
 
             // 月間出勤数: target
-            constraints.push(constraint!(month_work_sum == target as f64));
+            if stage == 1 {
+                constraints.push(constraint!(month_work_sum == target as f64));
+            } else {
+                let slack_under = vars.add(variable().min(0.0));
+                let slack_over = vars.add(variable().min(0.0));
+                constraints.push(constraint!(month_work_sum.clone() + slack_under >= target as f64));
+                constraints.push(constraint!(month_work_sum - slack_over <= target as f64));
+                objective += (slack_under + slack_over) * (WEIGHT_FIXED_OFF_SHORTAGE / 10) as f64;
+            }
         } else if staff.basic_off_type == OffType::And && !staff.basic_off_days.is_empty() {
             // AND 固定公休スタッフ
             for &d in &ctx.clinic_days {
@@ -687,7 +695,15 @@ fn build_and_solve_stage(
                 constraints.push(constraint!(month_work_sum <= (target + 5) as f64));
                 objective += extra_work * WEIGHT_SPECIAL_EXTRA_WORK as f64;
             } else {
-                constraints.push(constraint!(month_work_sum == target as f64));
+                if stage == 1 {
+                    constraints.push(constraint!(month_work_sum == target as f64));
+                } else {
+                    let slack_under = vars.add(variable().min(0.0));
+                    let slack_over = vars.add(variable().min(0.0));
+                    constraints.push(constraint!(month_work_sum.clone() + slack_under >= target as f64));
+                    constraints.push(constraint!(month_work_sum - slack_over <= target as f64));
+                    objective += (slack_under + slack_over) * (WEIGHT_FIXED_OFF_SHORTAGE / 10) as f64;
+                }
             }
         }
 

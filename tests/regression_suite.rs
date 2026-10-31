@@ -9,13 +9,19 @@
 //! - test_05_weekly_balance_and_2f_back_4staff: 週単位公休平準化および2階裏4名体制最低日数確保検証
 //! - test_06_prev_month_linking: 前月末尾実績からの末尾7日連勤引き継ぎと月初連勤上限遵守検証
 //! - test_07_second_off_monthly_rotation: 週4日×固定1日スタッフの第1公休固定＋第2公休月内固定＆ローテーション検証
+//! - test_08_renderer_excel_output: 現場フォーマット Excel 出力と calamine 再読込・書式検証 (Phase 3)
+//! - test_09_multi_month_continuous_generation: ShiftGenerator による複数月連続生成＆月跨ぎ引き継ぎ検証 (Phase 3)
 
+use calamine::{open_workbook_auto, Reader};
 use chrono::{Datelike, NaiveDate};
+use shift_core::generator::{GenerateOptions, ShiftGenerator};
 use shift_core::holidays::{calculate_japanese_holidays, get_holidays};
 use shift_core::parser::{excel_serial_to_date, parse_date_list, parse_shift_excel, ParsedExcelData};
+use shift_core::renderer::render_shifts_to_file;
 use shift_core::solver::{solve_shift, MonthContext};
 use std::collections::HashMap;
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 /// テスト用実データExcelのパースヘルパー
 fn load_test_excel() -> (ParsedExcelData, HashMap<NaiveDate, String>) {
@@ -323,3 +329,140 @@ fn test_07_second_off_monthly_rotation() {
         );
     }
 }
+
+// ============================================================================
+// 8. test_08_renderer_excel_output: 現場フォーマット Excel 出力と calamine 再読込・書式検証 (Phase 3)
+// ============================================================================
+#[test]
+fn test_08_renderer_excel_output() {
+    let (parsed, holidays) = load_test_excel();
+    let res = solve_shift(&parsed, 2026, 9, &holidays);
+    assert!(res.success, "2026年9月のシフト生成が成功すること");
+
+    let out_path = PathBuf::from("target/test_output_2026_09.xlsx");
+    let _ = fs::remove_file(&out_path);
+
+    let results = vec![(2026, 9, res)];
+    render_shifts_to_file(&out_path, &parsed, &results, &holidays)
+        .expect("現場フォーマット Excel の出力に成功すること");
+
+    assert!(out_path.exists(), "出力ファイルが存在すること");
+
+    // calamine で生成された Excel ファイルを再読込して検証
+    let mut workbook = open_workbook_auto(&out_path).expect("出力Excelをcalamineで開けること");
+    let sheet_names = workbook.sheet_names();
+    assert!(
+        sheet_names.contains(&"2026年09月シフト".to_string()),
+        "シート名 '2026年09月シフト' が存在すること: {:?}",
+        sheet_names
+    );
+
+    let range = workbook
+        .worksheet_range("2026年09月シフト")
+        .expect("ワークシート '2026年09月シフト' が読み込めること");
+
+    let rows: Vec<Vec<calamine::Data>> = range.rows().map(|r| r.to_vec()).collect();
+    assert!(rows.len() >= 36, "タイトル+ヘッダー+30日+集計4行で最低36行存在すること (実: {}行)", rows.len());
+
+    // 行1: タイトル
+    let title_cell = rows[0][0].to_string();
+    assert!(title_cell.contains("2026年9月"), "タイトル行に '2026年9月' が含まれること: {}", title_cell);
+
+    // 行2: ヘッダー
+    let h_date = rows[1][0].to_string();
+    let h_wday = rows[1][1].to_string();
+    let h_desc = rows[1][2].to_string();
+    let h_warn = rows[1][3].to_string();
+    assert_eq!(h_date, "日付");
+    assert_eq!(h_wday, "曜日");
+    assert_eq!(h_desc, "備考");
+    assert_eq!(h_warn, "警告");
+
+    // 日曜・祝日の休業確認: 2026/9/6 は日曜、9/21 は敬老の日
+    // 日付1日は row[2], 6日は row[7], 21日は row[22]
+    let row_sep6 = &rows[7];
+    assert_eq!(row_sep6[0].to_string(), "6");
+    assert_eq!(row_sep6[1].to_string(), "日");
+    // コアスタッフのセルが "休業" であること
+    assert_eq!(row_sep6[4].to_string(), "休業");
+
+    let row_sep21 = &rows[22];
+    assert_eq!(row_sep21[0].to_string(), "21");
+    assert_eq!(row_sep21[1].to_string(), "月");
+    assert_eq!(row_sep21[2].to_string(), "敬老の日");
+    assert_eq!(row_sep21[4].to_string(), "休業");
+
+    // 下部集計行のラベル確認
+    // 30日月の最終日行は row[31], 集計行は row[32]〜row[35]
+    let r_work = &rows[32];
+    let r_target = &rows[33];
+    let r_off = &rows[34];
+    let r_main_off = &rows[35];
+
+    assert_eq!(r_work[2].to_string(), "合計出勤日数");
+    assert_eq!(r_target[2].to_string(), "所定勤務日数");
+    assert_eq!(r_off[2].to_string(), "公休日数");
+    assert_eq!(r_main_off[2].to_string(), "主公休曜日");
+
+    // 所定勤務日数行のスタッフセルに数値が入っていること
+    let target_val_str = r_target[4].to_string();
+    let target_val: i32 = target_val_str.parse().unwrap_or(-1);
+    assert!(target_val > 0, "所定勤務日数セルが正の整数値であること: {}", target_val_str);
+
+    // テスト後の一時ファイル削除
+    let _ = fs::remove_file(&out_path);
+}
+
+
+
+
+
+
+
+// ============================================================================
+// 9. test_09_multi_month_continuous_generation: ShiftGenerator 連続生成＆月跨ぎ引き継ぎ検証 (Phase 3)
+// ============================================================================
+#[test]
+fn test_09_multi_month_continuous_generation() {
+    let (parsed, holidays) = load_test_excel();
+
+    // 2ヶ月連続生成テスト (2026年9月、2026年10月)
+    let test_months = vec![(2026, 9), (2026, 10)];
+    let out_path = PathBuf::from("target/test_output_multi_month.xlsx");
+    let _ = fs::remove_file(&out_path);
+
+    let options = GenerateOptions {
+        target_months: Some(test_months),
+        output_path: Some(out_path.clone()),
+    };
+
+    let mut log_count = 0;
+    let res = ShiftGenerator::generate(&parsed, &holidays, &options, |_idx, _total, _y, _m, msg| {
+        println!("[ShiftGenerator Progress] {}", msg);
+        log_count += 1;
+    });
+
+    assert!(res.is_ok(), "2ヶ月連続シフト生成が成功すること: {:?}", res.err());
+    let (saved_path, month_results) = res.unwrap();
+    assert_eq!(saved_path, out_path);
+    assert_eq!(month_results.len(), 2, "2ヶ月分の結果が返されること");
+
+    assert!(month_results[0].2.success, "2026年9月のソルブが成功すること");
+    assert!(month_results[1].2.success, "2026年10月のソルブが成功すること");
+    assert!(log_count > 0, "進捗コールバックが複数回呼び出されていること");
+
+    // 生成された Excel に両方のシートが含まれていること
+    let workbook = open_workbook_auto(&out_path).expect("出力Excelが開けること");
+    let sheets = workbook.sheet_names();
+    assert!(sheets.contains(&"2026年09月シフト".to_string()), "9月シートが存在すること");
+    assert!(sheets.contains(&"2026年10月シフト".to_string()), "10月シートが存在すること");
+
+    // テスト後の一時ファイル削除
+    let _ = fs::remove_file(&out_path);
+}
+
+
+
+
+
+
