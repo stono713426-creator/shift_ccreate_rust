@@ -1,10 +1,11 @@
 //! 勤務シフト自動生成システム 複数月連続生成サービス (`generator.rs`)
 //!
-//! Version: v1.0.0
-//! Updated: 2026-10-31 - Phase 3 実装: 複数月連続生成・月跨ぎ実績引き継ぎ・Excel一括レンダリング
+//! Version: v1.2.0
+//! Updated: 2026-11-01 - v1.2.0 前月シフト実績シートの年月整合ガード・過去最大3ヶ月主公休履歴の引き継ぎ実装
+//! - v1.0.0 (2026-10-31): Phase 3 実装: 複数月連続生成・月跨ぎ実績引き継ぎ・Excel一括レンダリング
 //!
 //! - 入力Excelデータおよび対象月リスト（target_months）に基づく連続ソルブ
-//! - 前月実績（末尾7日間の出勤フラグ＆主公休曜日履歴）を次月に自動引き継ぎ
+//! - 前月実績（末尾7日間の出勤フラグ＆過去最大3ヶ月の主公休曜日履歴）を次月に自動引き継ぎ
 //! - SPECIFICATION.md セクション6 準拠のデフォルト出力ファイル名決定
 //! - 進捗通知コールバック（CLI / GUI 対応）
 
@@ -82,7 +83,66 @@ impl ShiftGenerator {
         // 月跨ぎ実績を引き継ぎながら連続生成
         let mut working_parsed = parsed.clone();
 
+        // 初期状態において prev_month_main_offs のみ設定されている場合は history にも同期
+        for (s_name, &w) in &working_parsed.prev_month_main_offs {
+            let entry = working_parsed
+                .prev_month_main_offs_history
+                .entry(s_name.clone())
+                .or_default();
+            if entry.is_empty() {
+                entry.push(w);
+            }
+        }
+
+        // 「前月シフト実績」シート由来の初期データを退避（シート記載年月の翌月のみ適用するガード用）
+        let sheet_tail = working_parsed.prev_month_tail_shifts.clone();
+        let sheet_offs = working_parsed.prev_month_main_offs.clone();
+        let sheet_hist = working_parsed.prev_month_main_offs_history.clone();
+        let expected_from_sheet = parsed.prev_sheet_year_month.map(|(py, pm)| {
+            if pm == 12 {
+                (py + 1, 1)
+            } else {
+                (py, pm + 1)
+            }
+        });
+
         for (idx, &(year, month)) in months.iter().enumerate() {
+            // 年月連続性および「前月シフト実績」シートの対象年月整合チェック
+            let is_contiguous_from_prev_solved = if idx > 0 {
+                let (prev_y, prev_m) = months[idx - 1];
+                let next_of_prev = if prev_m == 12 {
+                    (prev_y + 1, 1)
+                } else {
+                    (prev_y, prev_m + 1)
+                };
+                next_of_prev == (year, month) && results.get(idx - 1).map(|r: &(i32, u32, SolveResult)| r.2.success).unwrap_or(false)
+            } else {
+                false
+            };
+
+            if !is_contiguous_from_prev_solved {
+                match expected_from_sheet {
+                    Some(exp_ym) if exp_ym != (year, month) => {
+                        // 例: 前月実績シートが「2026年12月」なのに「2026年9月」から生成する場合はクリア
+                        working_parsed.prev_month_tail_shifts.clear();
+                        working_parsed.prev_month_main_offs.clear();
+                        working_parsed.prev_month_main_offs_history.clear();
+                    }
+                    Some(exp_ym) if exp_ym == (year, month) => {
+                        // 前月を解かずにシート記載年月の翌月（例: 2027年1月）を解く場合はシート実績を復元
+                        working_parsed.prev_month_tail_shifts = sheet_tail.clone();
+                        working_parsed.prev_month_main_offs = sheet_offs.clone();
+                        working_parsed.prev_month_main_offs_history = sheet_hist.clone();
+                    }
+                    _ => {
+                        if idx > 0 {
+                            // シート年月不明かつ飛び月生成の場合は連勤引き継ぎのみクリア
+                            working_parsed.prev_month_tail_shifts.clear();
+                        }
+                    }
+                }
+            }
+
             let month_label = format!("{}年{:02}月", year, month);
             progress_cb(
                 idx,
@@ -108,8 +168,16 @@ impl ShiftGenerator {
                 );
 
                 // 次月への実績引き継ぎ
-                // 1. 当月主公休曜日 (main_offs) の引き継ぎ
+                // 1. 当月主公休曜日 (main_offs) および過去最大3ヶ月分の履歴引き継ぎ
                 working_parsed.prev_month_main_offs = solve_res.main_offs.clone();
+                for (s_name, &w) in &solve_res.main_offs {
+                    let hist = working_parsed
+                        .prev_month_main_offs_history
+                        .entry(s_name.clone())
+                        .or_default();
+                    hist.insert(0, w);
+                    hist.truncate(3);
+                }
 
                 // 2. 当月末尾7日間の出勤実績 (tail_shifts) の引き継ぎ
                 let month_ctx = MonthContext::new(year, month, holidays);

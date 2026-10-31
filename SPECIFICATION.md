@@ -1,7 +1,7 @@
 # 勤務シフト自動生成システム (Rust Edition) 完全移植仕様書
 
-- **Version**: `v1.1.0`
-- **Last Updated**: `2026-10-31`
+- **Version**: `v1.2.0`
+- **Last Updated**: `2026-11-01`
 - **移植元リファレンス**: `C:\Users\stono\projects\sift_create` (`v1.9.1`)
 
 本書は、Python版 `sift_create` (`v1.9.1`) の全仕様・定数・数理制約・日付パース規則・Excel入出力フォーマット・GUI仕様を **1つも漏らさず 100% 純Rustで再現するためのマスター仕様書** です。

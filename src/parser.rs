@@ -1,7 +1,8 @@
 //! 勤務シフト自動生成システム Excelデータ解析・日付パーサー (`parser.rs`)
 //!
-//! Version: v1.1.0
-//! Updated: 2026-10-31 - v1.1.0 パーサー修正: シフト制約条件シートの列ヘッダー検出(適用条件・制限タイプ・所属)修正および除外フラグ大文字小文字対応
+//! Version: v1.2.0
+//! Updated: 2026-11-01 - v1.2.0 パーサー全面堅牢化: 年跨ぎM/D自動年補完、同日複数OPE統合、前月実績年月認識、3ヶ月履歴初期化、パート希望出勤曜日補完、OR表記拡張
+//! - v1.1.0 (2026-10-31): シフト制約条件シートの列ヘッダー検出修正および除外フラグ大文字小文字対応
 //! - v1.0.1 (2026-10-31): 範囲日付パーサー改修(スペースなしハイフン範囲・年跨ぎ範囲対応)
 //!
 //! SPECIFICATION.md セクション4 に基づく完全移植パーサー。
@@ -68,6 +69,12 @@ pub struct ParsedExcelData {
     pub marked_months: Vec<(i32, u32)>,
     pub config: ShiftConfig,
     pub prev_month_main_offs: HashMap<String, u32>,
+    /// 直近最大3ヶ月分の主公休（または週4第2公休）曜日履歴（先頭が直近1ヶ月前: `[prev_1m, prev_2m, prev_3m]`）
+    #[serde(default)]
+    pub prev_month_main_offs_history: HashMap<String, Vec<u32>>,
+    /// 前月シフト実績シートのタイトル等から検出された年月 `(year, month)`
+    #[serde(default)]
+    pub prev_sheet_year_month: Option<(i32, u32)>,
     pub prev_month_tail_shifts: HashMap<String, Vec<u8>>,
     pub existing_shifts: HashMap<(i32, u32), HashMap<String, HashMap<u32, u8>>>,
 }
@@ -82,6 +89,17 @@ pub struct ParsedExcelData {
 pub fn parse_date_list(
     cell: &Data,
     default_year: i32,
+    holidays_jp_dict: Option<&HashMap<NaiveDate, String>>,
+) -> HashSet<NaiveDate> {
+    parse_date_list_for_months(cell, default_year, &[], holidays_jp_dict)
+}
+
+/// 対象年月リスト (`target_months`) を考慮してセル値から日付リストをパースする。
+/// 年省略表記 (`M/D`) が入力された場合、`target_months` に該当月があればその年（例: 9月〜翌3月表での `1/15` -> 翌年1月）を優先補完する。
+pub fn parse_date_list_for_months(
+    cell: &Data,
+    default_year: i32,
+    target_months: &[(i32, u32)],
     holidays_jp_dict: Option<&HashMap<NaiveDate, String>>,
 ) -> HashSet<NaiveDate> {
     let mut dates = HashSet::new();
@@ -153,7 +171,7 @@ pub fn parse_date_list(
 
             // 各トークンの日付・範囲パース
             for tok in raw_tokens {
-                parse_date_token(tok, default_year, &mut dates);
+                parse_date_token(tok, default_year, target_months, &mut dates);
             }
         }
         _ => {}
@@ -162,10 +180,22 @@ pub fn parse_date_list(
     filter_holidays_sundays(dates, holidays_jp_dict)
 }
 
+/// 年省略 (`M/D`) 時の年を対象月リスト `target_months` から解決するヘルパー
+fn resolve_year_for_month(month: u32, default_year: i32, target_months: &[(i32, u32)]) -> i32 {
+    if target_months.is_empty() || target_months.contains(&(default_year, month)) {
+        return default_year;
+    }
+    if let Some(&(y, _)) = target_months.iter().find(|&&(_, m)| m == month) {
+        return y;
+    }
+    default_year
+}
+
 /// トークン文字列から日付範囲または単一日付を抽出し dates に追加
 fn parse_date_token(
     tok: &str,
     default_year: i32,
+    target_months: &[(i32, u32)],
     dates: &mut HashSet<NaiveDate>,
 ) {
     // 範囲表現正規表現:
@@ -183,10 +213,14 @@ fn parse_date_token(
         let s1 = cap.get(1).unwrap().as_str();
         let s2 = cap.get(2).unwrap().as_str();
 
-        let d1 = parse_single_date(s1, default_year);
-        // 開始日に年が明記されていれば終了日のデフォルト年として引き継ぐ
+        let d1 = parse_single_date_with_months(s1, default_year, target_months);
+        // 開始日に年が確定していれば終了日の基準年として引き継ぐ
         let year_for_d2 = d1.map(|d| d.year()).unwrap_or(default_year);
-        let d2 = parse_single_date(s2, year_for_d2);
+        let d2 = if has_explicit_year(s1) {
+            parse_single_date(s2, year_for_d2)
+        } else {
+            parse_single_date_with_months(s2, year_for_d2, target_months)
+        };
 
         if let (Some(mut start), Some(mut end)) = (d1, d2) {
             // 年跨ぎ補正 (例: 12/29 - 1/4)
@@ -214,7 +248,7 @@ fn parse_date_token(
 
     // 残りの文字列から単一日付をパース (空白区切り)
     for part in remaining.split_whitespace() {
-        if let Some(d) = parse_single_date(part, default_year) {
+        if let Some(d) = parse_single_date_with_months(part, default_year, target_months) {
             dates.insert(d);
         }
     }
@@ -233,6 +267,33 @@ fn has_explicit_year(s: &str) -> bool {
         .filter(|p| !p.is_empty())
         .collect();
     parts.len() >= 3
+}
+
+/// 単一の日付文字列をパース (`target_months` による年補完対応)
+fn parse_single_date_with_months(
+    s: &str,
+    default_year: i32,
+    target_months: &[(i32, u32)],
+) -> Option<NaiveDate> {
+    let cleaned = s
+        .trim()
+        .replace('年', "/")
+        .replace('月', "/")
+        .replace('.', "/")
+        .replace('日', "");
+    let parts: Vec<&str> = cleaned
+        .split(['/', '-'])
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty())
+        .collect();
+
+    if parts.len() == 2 {
+        let m = parts[0].parse::<u32>().ok()?;
+        let d = parts[1].parse::<u32>().ok()?;
+        let resolved_y = resolve_year_for_month(m, default_year, target_months);
+        return NaiveDate::from_ymd_opt(resolved_y, m, d);
+    }
+    parse_single_date(s, default_year)
 }
 
 /// 単一の日付文字列をパース
@@ -337,8 +398,9 @@ pub fn parse_shift_excel<P: AsRef<Path>>(
     let mut marked_months: Vec<(i32, u32)> = marked_months_set.into_iter().collect();
     marked_months.sort_unstable();
 
-    // デフォルト年（対象月の先頭、なければ現在の年または2024）
-    let default_year = target_months.first().map(|(y, _)| *y).unwrap_or(2024);
+    // デフォルト年（対象月の先頭、なければ現在の年）
+    let current_year = chrono::Local::now().year();
+    let default_year = target_months.first().map(|(y, _)| *y).unwrap_or(current_year);
 
     // 3. スタッフマスタシートの探索とパース
     // 優先順: 「スタッフ」/「マスタ」/「勤務条件」を含むシート、なければ0番目
@@ -348,7 +410,7 @@ pub fn parse_shift_excel<P: AsRef<Path>>(
         .unwrap_or(&sheet_names[0]);
 
     let staffs = if let Ok(range) = workbook.worksheet_range(staff_sheet_name) {
-        parse_staff_sheet(&range, default_year, holidays, &config)?
+        parse_staff_sheet(&range, default_year, &target_months, holidays, &config)?
     } else {
         return Err(format!("スタッフマスタシート '{staff_sheet_name}' を読み込めません。"));
     };
@@ -374,13 +436,23 @@ pub fn parse_shift_excel<P: AsRef<Path>>(
 
     // 5. 前月実績シートの探索とパース
     let mut prev_month_main_offs = HashMap::new();
+    let mut prev_month_main_offs_history: HashMap<String, Vec<u32>> = HashMap::new();
+    let mut prev_sheet_year_month = None;
     let mut prev_month_tail_shifts = HashMap::new();
     for s_name in &sheet_names {
         if s_name.contains("前月") || s_name.contains("実績") {
             if let Ok(range) = workbook.worksheet_range(s_name) {
-                parse_prev_month_sheet(&range, &mut prev_month_main_offs, &mut prev_month_tail_shifts);
+                parse_prev_month_sheet(
+                    &range,
+                    &mut prev_month_main_offs,
+                    &mut prev_month_tail_shifts,
+                    &mut prev_sheet_year_month,
+                );
             }
         }
+    }
+    for (staff_name, &w) in &prev_month_main_offs {
+        prev_month_main_offs_history.insert(staff_name.clone(), vec![w]);
     }
 
     // 6. 既存生成シフトシートの探索 (例: "2024年09月シフト", "24年09月シフト")
@@ -388,7 +460,7 @@ pub fn parse_shift_excel<P: AsRef<Path>>(
     let re_shift_sheet = Regex::new(r"(\d{2,4})年(\d{1,2})月(?:シフト)?").unwrap();
     for s_name in &sheet_names {
         if let Some(caps) = re_shift_sheet.captures(s_name) {
-            let mut y = caps[1].parse::<i32>().unwrap_or(2024);
+            let mut y = caps[1].parse::<i32>().unwrap_or(default_year);
             if y < 100 {
                 y += 2000;
             }
@@ -409,6 +481,8 @@ pub fn parse_shift_excel<P: AsRef<Path>>(
         marked_months,
         config,
         prev_month_main_offs,
+        prev_month_main_offs_history,
+        prev_sheet_year_month,
         prev_month_tail_shifts,
         existing_shifts,
     })
@@ -451,15 +525,16 @@ fn parse_ope_sheet(
 
     for (r_idx, row) in rows.iter().enumerate().take(5) {
         for (c_idx, cell) in row.iter().enumerate() {
-            let s = cell.to_string();
-            if s.contains("日付") || s.contains("日") || s.to_lowercase().contains("date") {
-                col_date = Some(c_idx);
-            }
-            if s.contains("種別") || s.contains("内容") || s.contains("手術") || s.contains("OPE") || s.contains("オペ") {
-                col_type = Some(c_idx);
-            }
+            let s = cell.to_string().trim().to_string();
+            let s_lower = s.to_lowercase();
             if s.contains("作成") || s.contains("対象") || s.contains("出力") || s.contains("生成") {
                 col_target = Some(c_idx);
+            } else if s.contains("種別") || s.contains("内容") || s.contains("手術") || s_lower.contains("ope") || s.contains("オペ") {
+                col_type = Some(c_idx);
+            } else if s.contains("日付") || s_lower.contains("date") {
+                col_date = Some(c_idx);
+            } else if col_date.is_none() && s.contains("日") && !s.contains("曜日") {
+                col_date = Some(c_idx);
             }
         }
         if col_date.is_some() {
@@ -468,11 +543,26 @@ fn parse_ope_sheet(
         }
     }
 
-    let c_date = match col_date {
-        Some(c) => c,
-        None => 0,
-    };
+    let c_date = col_date.unwrap_or(0);
     let c_type = col_type.unwrap_or(1);
+
+    // 初期基準年の推定（シート内に明示年またはシリアル値があれば先頭の年、なければ現在年）
+    let mut running_year = chrono::Local::now().year();
+    for row in rows.iter().skip(header_row_idx + 1) {
+        if let Some(cell) = row.get(c_date) {
+            let s = cell.to_string();
+            if matches!(cell, Data::Int(_) | Data::Float(_) | Data::DateTime(_) | Data::DateTimeIso(_))
+                || has_explicit_year(&s)
+            {
+                let probe = parse_date_list(cell, running_year, None);
+                if let Some(d) = probe.iter().min() {
+                    running_year = d.year();
+                    break;
+                }
+            }
+        }
+    }
+    let mut prev_month: Option<u32> = None;
 
     for row in rows.iter().skip(header_row_idx + 1) {
         if row.len() <= c_date {
@@ -481,13 +571,35 @@ fn parse_ope_sheet(
         let date_cell = &row[c_date];
         let type_cell = if row.len() > c_type { &row[c_type] } else { &Data::Empty };
 
-        let parsed_dates = parse_date_list(date_cell, 2024, None);
+        let raw_s = date_cell.to_string();
+        let is_yearless_str = matches!(date_cell, Data::String(_))
+            && !has_explicit_year(&raw_s)
+            && !raw_s.trim().chars().all(|c| c.is_ascii_digit() || c == '.');
+
+        let mut parsed_vec: Vec<NaiveDate> = parse_date_list(date_cell, running_year, None)
+            .into_iter()
+            .collect();
+        parsed_vec.sort_unstable();
+
+        // 年省略表記で12月 -> 1月のように月が巻き戻った場合は翌年へロールオーバー
+        if is_yearless_str {
+            if let (Some(pm), Some(first_d)) = (prev_month, parsed_vec.first()) {
+                if first_d.month() < pm && pm >= 10 && first_d.month() <= 3 {
+                    running_year += 1;
+                    parsed_vec = parse_date_list(date_cell, running_year, None)
+                        .into_iter()
+                        .collect();
+                    parsed_vec.sort_unstable();
+                }
+            }
+        }
+
         let type_str = type_cell.to_string().trim().to_string();
 
         let is_marked = if let Some(ct) = col_target {
             if row.len() > ct {
                 let val_str = row[ct].to_string().trim().to_string();
-                val_str == "○" || val_str == "◯" || val_str == "1" || val_str.to_lowercase() == "true"
+                val_str == "○" || val_str == "◯" || val_str == "1" || val_str.eq_ignore_ascii_case("true")
             } else {
                 false
             }
@@ -495,13 +607,23 @@ fn parse_ope_sheet(
             false
         };
 
-        for d in parsed_dates {
+        for d in parsed_vec {
+            running_year = d.year();
+            prev_month = Some(d.month());
             target_months.insert((d.year(), d.month()));
             if is_marked {
                 marked_months.insert((d.year(), d.month()));
             }
             if !type_str.is_empty() {
-                ope_dict.insert(d, type_str.clone());
+                ope_dict
+                    .entry(d)
+                    .and_modify(|existing| {
+                        if !existing.contains(&type_str) {
+                            existing.push(',');
+                            existing.push_str(&type_str);
+                        }
+                    })
+                    .or_insert_with(|| type_str.clone());
             }
         }
     }
@@ -511,6 +633,7 @@ fn parse_ope_sheet(
 fn parse_staff_sheet(
     range: &Range<Data>,
     default_year: i32,
+    target_months: &[(i32, u32)],
     holidays: &HashMap<NaiveDate, String>,
     config: &ShiftConfig,
 ) -> Result<Vec<Staff>, String> {
@@ -519,13 +642,14 @@ fn parse_staff_sheet(
         return Err("スタッフシートが空です。".to_string());
     }
 
-    // ヘッダー行探索 (氏名, 所属, 雇用形態, 基本公休, 有休, 特別有休, 希望休, 指定公休, 除外)
+    // ヘッダー行探索 (氏名, 所属, 雇用形態, 基本公休, 有休, 特別有休, 希望休, 指定公休, 希望出勤曜日, 除外)
     let mut col_name = None;
     let mut col_section = None;
     let mut col_role = None;
     let mut col_employment = None;
     let mut col_pattern = None;
     let mut col_basic_off = None;
+    let mut col_preferred_work = None;
     let mut col_vacation = None;
     let mut col_special_vacation = None;
     let mut col_preferred_off = None;
@@ -550,13 +674,18 @@ fn parse_staff_sheet(
                 col_pattern = Some(c_idx);
             } else if s.contains("希望公休曜日") || s.contains("基本公休") || s.contains("公休曜日") {
                 col_basic_off = Some(c_idx);
+            } else if s.contains("希望出勤") || s.contains("出勤曜日") {
+                col_preferred_work = Some(c_idx);
             } else if s.contains("特別") {
                 col_special_vacation = Some(c_idx);
             } else if s.contains("有休") {
                 col_vacation = Some(c_idx);
             } else if s.contains("希望休") {
                 col_preferred_off = Some(c_idx);
-            } else if s.contains("指定公休") || s.contains("公休指定") {
+            } else if s.contains("指定公休")
+                || s.contains("公休指定")
+                || (s.contains("公休") && !s.contains("曜日") && (s.contains("指定") || s.contains("日")))
+            {
                 col_specified_off = Some(c_idx);
             }
         }
@@ -587,6 +716,7 @@ fn parse_staff_sheet(
                     || ex_val.eq_ignore_ascii_case("true")
                     || ex_val == "○"
                     || ex_val == "◯"
+                    || ex_val.contains("除外")
                 {
                     continue;
                 }
@@ -601,27 +731,19 @@ fn parse_staff_sheet(
         let basic_off_str = col_basic_off.and_then(|c| row.get(c)).map(|d| d.to_string().trim().to_string()).unwrap_or_default();
 
         // 曜日抽出: 月火水木金土日 -> 0..=6
-        let mut basic_off_days = Vec::new();
-        for ch in basic_off_str.chars() {
-            let day_num = match ch {
-                '月' => Some(0),
-                '火' => Some(1),
-                '水' => Some(2),
-                '木' => Some(3),
-                '金' => Some(4),
-                '土' => Some(5),
-                '日' => Some(6),
-                _ => None,
-            };
-            if let Some(w) = day_num {
-                if !basic_off_days.contains(&w) {
-                    basic_off_days.push(w);
-                }
-            }
-        }
+        let mut basic_off_days = extract_weekdays(&basic_off_str);
 
-        // basic_off_type
-        let basic_off_type = if basic_off_str.contains("もしくは") || basic_off_str.contains("あるいは") {
+        let is_core = employment == "正社員" || employment == "パート社員";
+        let is_part_1f = section == "1階" && employment == "パート";
+        let is_special = pattern.contains("必要に応じて週5") || pattern.contains("必要に応じて");
+
+        // basic_off_type (もしくは / あるいは / または / or に対応)
+        let basic_off_lower = basic_off_str.to_lowercase();
+        let mut basic_off_type = if basic_off_str.contains("もしくは")
+            || basic_off_str.contains("あるいは")
+            || basic_off_str.contains("または")
+            || basic_off_lower.contains("or")
+        {
             OffType::Or
         } else if !basic_off_days.is_empty() {
             OffType::And
@@ -629,33 +751,44 @@ fn parse_staff_sheet(
             OffType::Or
         };
 
-        // 有休（日・祝除外）
+        // 非コアスタッフ（パート等）で「希望公休曜日」が空欄かつ「希望出勤曜日」のみ記入されている場合の自動補完
+        if !is_core && basic_off_days.is_empty() {
+            let pref_work_str = col_preferred_work
+                .and_then(|c| row.get(c))
+                .map(|d| d.to_string().trim().to_string())
+                .unwrap_or_default();
+            if !pref_work_str.is_empty() && !pref_work_str.contains("必須") {
+                let work_days = extract_weekdays(&pref_work_str);
+                if !work_days.is_empty() {
+                    basic_off_days = (0..=6).filter(|w| !work_days.contains(w)).collect();
+                    basic_off_type = OffType::And;
+                }
+            }
+        }
+
+        // 有休（日・祝除外、年省略時の target_months 補完対応）
         let vacation_dates = col_vacation
             .and_then(|c| row.get(c))
-            .map(|d| parse_date_list(d, default_year, Some(holidays)))
+            .map(|d| parse_date_list_for_months(d, default_year, target_months, Some(holidays)))
             .unwrap_or_default();
 
         // 特別有休（日・祝除外）
         let special_vacation_dates = col_special_vacation
             .and_then(|c| row.get(c))
-            .map(|d| parse_date_list(d, default_year, Some(holidays)))
+            .map(|d| parse_date_list_for_months(d, default_year, target_months, Some(holidays)))
             .unwrap_or_default();
 
         // 希望休（日・祝除外しない）
         let preferred_off_dates = col_preferred_off
             .and_then(|c| row.get(c))
-            .map(|d| parse_date_list(d, default_year, None))
+            .map(|d| parse_date_list_for_months(d, default_year, target_months, None))
             .unwrap_or_default();
 
         // 指定公休（日・祝除外）
         let specified_off_dates = col_specified_off
             .and_then(|c| row.get(c))
-            .map(|d| parse_date_list(d, default_year, Some(holidays)))
+            .map(|d| parse_date_list_for_months(d, default_year, target_months, Some(holidays)))
             .unwrap_or_default();
-
-        let is_core = employment == "正社員" || employment == "パート社員";
-        let is_part_1f = section == "1階" && employment == "パート";
-        let is_special = pattern.contains("必要に応じて週5") || pattern.contains("必要に応じて");
 
         let mut staff = Staff {
             name,
@@ -692,6 +825,49 @@ fn parse_staff_sheet(
     }
 
     Ok(staffs)
+}
+
+/// 文字列から曜日番号 (0=月..6=日) を出現順・重複なしで抽出
+fn extract_weekdays(s: &str) -> Vec<u32> {
+    let mut days = Vec::new();
+    for ch in s.chars() {
+        let day_num = match ch {
+            '月' => Some(0),
+            '火' => Some(1),
+            '水' => Some(2),
+            '木' => Some(3),
+            '金' => Some(4),
+            '土' => Some(5),
+            '日' => Some(6),
+            _ => None,
+        };
+        if let Some(w) = day_num {
+            if !days.contains(&w) {
+                days.push(w);
+            }
+        }
+    }
+    days
+}
+
+/// 任意のセル値から整数 (`i32`) を堅牢に抽出（Int / Float / 全角数字文字列すべて対応）
+fn cell_to_i32(cell: &Data) -> Option<i32> {
+    match cell {
+        Data::Int(i) => Some(*i as i32),
+        Data::Float(f) => Some(f.round() as i32),
+        Data::String(s) => {
+            let norm: String = s.nfkc().collect();
+            let trimmed = norm.trim();
+            if let Ok(i) = trimmed.parse::<i32>() {
+                Some(i)
+            } else if let Ok(f) = trimmed.parse::<f64>() {
+                Some(f.round() as i32)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
 }
 
 /// シフト制約条件シートのパース
@@ -772,9 +948,9 @@ fn parse_rules_sheet(range: &Range<Data>, rules: &mut Vec<ShiftRule>) {
             .filter(|s| !s.is_empty())
             .collect();
 
-        let val_min = col_min.and_then(|c| row.get(c)).and_then(|d| d.to_string().trim().parse::<i32>().ok()).unwrap_or(0);
-        let val_rec = col_rec.and_then(|c| row.get(c)).and_then(|d| d.to_string().trim().parse::<i32>().ok()).unwrap_or(0);
-        let val_max = col_max.and_then(|c| row.get(c)).and_then(|d| d.to_string().trim().parse::<i32>().ok()).unwrap_or(99);
+        let val_min = col_min.and_then(|c| row.get(c)).and_then(cell_to_i32).unwrap_or(0);
+        let val_rec = col_rec.and_then(|c| row.get(c)).and_then(cell_to_i32).unwrap_or(0);
+        let val_max = col_max.and_then(|c| row.get(c)).and_then(cell_to_i32).unwrap_or(99);
         let level = col_level.and_then(|c| row.get(c)).map(|d| d.to_string().trim().to_string()).unwrap_or_else(|| "SOFT".to_string());
 
         rules.push(ShiftRule {
@@ -791,15 +967,38 @@ fn parse_rules_sheet(range: &Range<Data>, rules: &mut Vec<ShiftRule>) {
     }
 }
 
-/// 前月実績シートのパース（縦型フォーマット・横型フォーマット両対応）
+/// 前月実績シートのパース（縦型フォーマット・横型フォーマット両対応、タイトル行の年月抽出対応）
 fn parse_prev_month_sheet(
     range: &Range<Data>,
     main_offs: &mut HashMap<String, u32>,
     tail_shifts: &mut HashMap<String, Vec<u8>>,
+    sheet_year_month: &mut Option<(i32, u32)>,
 ) {
     let rows: Vec<&[Data]> = range.rows().collect();
     if rows.is_empty() {
         return;
+    }
+
+    // 先頭3行からタイトル年月 (例: "2026年12月 勤務シフト表") を検出
+    let re_ym = Regex::new(r"(\d{2,4})\s*年\s*(\d{1,2})\s*月").unwrap();
+    for row in rows.iter().take(3) {
+        for cell in row.iter().take(5) {
+            let norm: String = cell.to_string().nfkc().collect();
+            if let Some(caps) = re_ym.captures(&norm) {
+                if let (Ok(mut y), Ok(m)) = (caps[1].parse::<i32>(), caps[2].parse::<u32>()) {
+                    if y < 100 {
+                        y += 2000;
+                    }
+                    if (1..=12).contains(&m) {
+                        *sheet_year_month = Some((y, m));
+                        break;
+                    }
+                }
+            }
+        }
+        if sheet_year_month.is_some() {
+            break;
+        }
     }
 
     // 縦型フォーマット判定: 先頭5行以内に「日付」と「曜日」を含む

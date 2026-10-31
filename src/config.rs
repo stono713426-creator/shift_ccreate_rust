@@ -1,7 +1,8 @@
 //! 勤務シフト自動生成システム 設定モジュール (`config.rs`)
 //!
-//! Version: v1.1.0
-//! Updated: 2026-10-31 - v1.1.0 優先度階層強化: HIGH1推奨人数ペナルティ引き上げ(10M)および主公休スライド許容スラック重み追加
+//! Version: v1.2.0
+//! Updated: 2026-11-01 - v1.2.0 全15設定項目・全固定ペナルティ重みの完全連動 (HIGH1推奨重み 10.2M 微調整で一般セクションブレ幅スラック 10M より上位を確定)
+//! - v1.1.0 (2026-10-31): HIGH1推奨人数ペナルティ引き上げおよび主公休スライド許容スラック重み追加
 //! - v1.0.0 (2026-10-31): Phase 1 初期実装: 10段階制約重み、固定ペナルティ、ShiftConfig (全15項目)
 //!
 //! SPECIFICATION.md セクション2 に基づく定数・ペナルティ重み・動的設定の完全実装。
@@ -56,7 +57,7 @@ pub fn get_level_weight(level: &str) -> i64 {
 pub const REC_WEIGHT_HARD1: i64 = 12_000_000;
 pub const REC_WEIGHT_HARD2: i64 = 11_000_000;
 pub const REC_WEIGHT_HARD3: i64 = 10_500_000;
-pub const REC_WEIGHT_HIGH1: i64 = 10_000_000;
+pub const REC_WEIGHT_HIGH1: i64 = 10_200_000;
 pub const REC_WEIGHT_HIGH2: i64 = 4_000_000;
 pub const REC_WEIGHT_HIGH3: i64 = 2_000_000;
 pub const REC_WEIGHT_SOFT1: i64 = 400_000;
@@ -362,8 +363,9 @@ mod tests {
         assert_eq!(get_rec_weight("HARD1"), 12_000_000);
         assert_eq!(get_rec_weight("HARD"), 11_000_000);
         assert_eq!(get_rec_weight("HARD3"), 10_500_000);
-        assert_eq!(get_rec_weight("HIGH1"), 10_000_000);
+        assert_eq!(get_rec_weight("HIGH1"), 10_200_000);
         assert_eq!(get_rec_weight("HIGH2"), 4_000_000);
+        assert!(get_rec_weight("HIGH1") > WEIGHT_GENERAL_SEC_SLACK);
         assert!(get_rec_weight("HIGH1") > get_level_weight("HIGH2"));
         assert_eq!(get_rec_weight("SOFT2"), 200_000);
         assert_eq!(get_rec_weight("LOW"), 50_000);

@@ -1,7 +1,8 @@
 //! 勤務シフト自動生成システム 現場フォーマット Excel レンダラー (`renderer.rs`)
 //!
-//! Version: v1.0.0
-//! Updated: 2026-10-31 - Phase 3 実装: SPECIFICATION.md セクション6 完全準拠の現場フォーマット Excel 出力
+//! Version: v1.2.0
+//! Updated: 2026-11-01 - v1.2.0 リリースバージョン同期
+//! - v1.0.0 (2026-10-31): Phase 3 実装: SPECIFICATION.md セクション6 完全準拠の現場フォーマット Excel 出力
 //!
 //! - シート名: "{year}年{month:02}月シフト"
 //! - ウィンドウ枠固定: E3 (row 2, col 4)

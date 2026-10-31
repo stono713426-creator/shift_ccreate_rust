@@ -1,8 +1,8 @@
 # 勤務シフト自動生成システム (Rust Edition)
 
-> Version: v1.1.0  
-> Release Date: 2026-10-31  
-> Status: v1.1.0 Released & Verified 🎉
+> Version: v1.2.0  
+> Release Date: 2026-11-01  
+> Status: v1.2.0 Released & Verified 🎉
 
 医療機関等の複雑な勤務シフト制約を、オープンソース最高峰の数理最適化ソルバー（MILP: HiGHS）によって高速解決し、現場フォーマットの Excel 帳票として出力する **純Rust製ネイティブ・デスクトップアプリケーション** です（Python版 `sift_create` v1.9.1 の全仕様完全移植プロジェクト）。
 

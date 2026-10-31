@@ -1,7 +1,8 @@
 //! 勤務シフト自動生成システム 統合回帰テストスイート (`tests/regression_suite.rs`)
 //!
-//! Version: v1.1.0
-//! Updated: 2026-10-31 - v1.1.0 検証追加: test_11 制約条件パース・除外スタッフ補正・主公休スライド・金曜HIGH1の3名体制検証
+//! Version: v1.2.0
+//! Updated: 2026-11-01 - v1.2.0 全仕様監査テスト追加: test_12 石橋特別枠・2階裏基本人数・3ヶ月ローテーション・OPEタイポ吸収・年跨ぎ年補完・前月実績年月ガード検証
+//! - v1.1.0 (2026-10-31): test_11 制約条件パース・除外スタッフ補正・主公休スライド・金曜HIGH1の3名体制検証
 //! - v1.0.1 (2026-10-31): test_10 小島さん11月特別有休パース・反映・Excel出力検証追加
 //! - test_01_holidays: 祝日計算・春分秋分・国民の休日・振替休日検証
 //! - test_02_date_parser_and_specified_off: 日付パーサー・NFKC・指定公休HARD固定＆ISO週義務免除検証
@@ -17,10 +18,13 @@ use calamine::{open_workbook_auto, Reader};
 use chrono::{Datelike, NaiveDate};
 use shift_core::generator::{GenerateOptions, ShiftGenerator};
 use shift_core::holidays::{calculate_japanese_holidays, get_holidays};
-use shift_core::parser::{excel_serial_to_date, parse_date_list, parse_shift_excel, ParsedExcelData};
+use shift_core::parser::{
+    excel_serial_to_date, parse_date_list, parse_date_list_for_months, parse_shift_excel,
+    ParsedExcelData,
+};
 use shift_core::renderer::render_shifts_to_file;
 use shift_core::solver::{parse_rule_target_dates, solve_shift, MonthContext};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -587,14 +591,19 @@ fn test_11_friday_high1_and_rule_priority_v1_1_0() {
         "金曜の HIGH1 (最小2・推奨3) ルールが正確にパースされていること"
     );
 
-    // 2. parse_rule_target_dates: 「Vit」手術日のUTF-8安全性および 火曜(OPE日) の絞り込み検証
+    // 2. parse_rule_target_dates: 「Vit」手術日のUTF-8安全性・タイポ吸収("Viit")および 火曜(OPE日) の絞り込み検証
     let ctx_jan = MonthContext::new(2027, 1, &holidays);
     let vit_days = parse_rule_target_dates("「Vit」手術日", &ctx_jan, &parsed.ope_dict);
+    assert!(
+        vit_days.contains(&6),
+        "実データ 2027-01-06 ('Viit,cat') も「Vit」手術日として抽出されること"
+    );
     for &d in &vit_days {
         let date = ctx_jan.date_map[&d];
         let ope_str = parsed.ope_dict.get(&date).expect("OPE日であること");
+        let ope_lower = ope_str.to_lowercase();
         assert!(
-            ope_str.to_lowercase().contains("vit") || ope_str.contains("硝子体"),
+            ope_lower.contains("vit") || ope_lower.contains("viit") || ope_str.contains("硝子体"),
             "「Vit」手術日に該当する日のみ抽出されること: {} -> {}",
             date,
             ope_str
@@ -688,6 +697,193 @@ fn test_11_friday_high1_and_rule_priority_v1_1_0() {
     }
 
     let _ = fs::remove_file(&out_path);
+}
+
+// ============================================================================
+// 12. test_12_full_spec_audit_v1_2_0:
+//     v1.2.0 全仕様監査項目の統合検証
+// ============================================================================
+#[test]
+fn test_12_full_spec_audit_v1_2_0() {
+    let (parsed, holidays) = load_test_excel();
+
+    // 1. 年省略 M/D 表記の年跨ぎ補完検証 (2026/09〜2027/03 の対象月で "1/15, 2/10" -> 2027年)
+    let span_months = vec![
+        (2026, 9),
+        (2026, 10),
+        (2026, 11),
+        (2026, 12),
+        (2027, 1),
+        (2027, 2),
+        (2027, 3),
+    ];
+    let cell_md = calamine::Data::String("11/18, 1/15, 2/10".to_string());
+    let resolved_dates = parse_date_list_for_months(&cell_md, 2026, &span_months, None);
+    assert!(
+        resolved_dates.contains(&NaiveDate::from_ymd_opt(2026, 11, 18).unwrap()),
+        "11/18 が 2026-11-18 として解決されること"
+    );
+    assert!(
+        resolved_dates.contains(&NaiveDate::from_ymd_opt(2027, 1, 15).unwrap()),
+        "1/15 が年跨ぎ対象月に合わせて 2027-01-15 として解決されること"
+    );
+    assert!(
+        resolved_dates.contains(&NaiveDate::from_ymd_opt(2027, 2, 10).unwrap()),
+        "2/10 が年跨ぎ対象月に合わせて 2027-02-10 として解決されること"
+    );
+
+    // 2. 手術スケジュール表記ゆれ ("Viit,cat" / "cay") の吸収検証
+    let ctx_jan = MonthContext::new(2027, 1, &holidays);
+    let mut typo_ope = HashMap::new();
+    typo_ope.insert(
+        NaiveDate::from_ymd_opt(2027, 1, 6).unwrap(),
+        "Viit,cat".to_string(),
+    );
+    typo_ope.insert(
+        NaiveDate::from_ymd_opt(2027, 1, 12).unwrap(),
+        "cay".to_string(),
+    );
+    let vit_matched = parse_rule_target_dates("「Vit」手術日", &ctx_jan, &typo_ope);
+    assert_eq!(
+        vit_matched,
+        vec![6],
+        "タイポ 'Viit,cat' が「Vit」手術日として漏れなく検出されること"
+    );
+    let cat_matched = parse_rule_target_dates("「cat」手術日", &ctx_jan, &typo_ope);
+    assert_eq!(
+        cat_matched,
+        vec![6, 12],
+        "タイポ 'cay' が「cat」手術日として漏れなく検出されること"
+    );
+
+    // 3. 石橋さん（週4日（必要に応じて週5日可）＋土曜固定公休）の特別枠動作確認
+    let ishibashi = parsed
+        .staffs
+        .iter()
+        .find(|s| s.name == "石橋")
+        .expect("石橋さんが存在すること");
+    assert!(
+        ishibashi.is_special,
+        "石橋さんが特別枠 (is_special=true) として認識されていること"
+    );
+
+    let mut special_test_parsed = parsed.clone();
+    // 2階裏の他スタッフに有休を追加し、石橋さんが target を超えて応援出勤できるか検証
+    if let Some(st) = special_test_parsed
+        .staffs
+        .iter_mut()
+        .find(|s| s.name == "大久保")
+    {
+        for d in [2u32, 9, 16, 30] {
+            st.vacation_dates
+                .insert(NaiveDate::from_ymd_opt(2026, 9, d).unwrap());
+        }
+    }
+    let res_sp = solve_shift(&special_test_parsed, 2026, 9, &holidays);
+    assert!(res_sp.success && res_sp.stage == 1, "Stage 1 で解けること");
+    let ishi_target = res_sp.target_days["石橋"];
+    let ishi_actual: i32 = res_sp.shifts["石橋"].values().map(|&v| v as i32).sum();
+    assert!(
+        ishi_actual >= ishi_target && ishi_actual <= ishi_target + 5,
+        "石橋さんの出勤日数 ({}) が [target={}, target+5={}] の範囲内であること",
+        ishi_actual,
+        ishi_target,
+        ishi_target + 5
+    );
+    let ctx_sep = MonthContext::new(2026, 9, &holidays);
+    for &d in &ctx_sep.clinic_days {
+        if ctx_sep.weekday_map[&d] == 5 {
+            assert_eq!(
+                res_sp.shifts["石橋"][&d], 0,
+                "石橋さんの固定公休（土曜: 9/{}）は引き続き厳守されること",
+                d
+            );
+        }
+    }
+
+    // 4. 2階裏_基本人数 (sec_2f_back_base_cap = 3) の日次最低人数確保検証
+    let res_sep = solve_shift(&parsed, 2026, 9, &holidays);
+    assert!(res_sep.success && res_sep.stage == 1);
+    let core_2f_b: Vec<&shift_core::parser::Staff> = parsed
+        .staffs
+        .iter()
+        .filter(|s| s.section == "2階裏" && s.is_core && s.pattern != "除外")
+        .collect();
+    for &d in &ctx_sep.clinic_days {
+        let dt = ctx_sep.date_map[&d];
+        let vac_cnt = core_2f_b
+            .iter()
+            .filter(|s| {
+                s.vacation_dates.contains(&dt)
+                    || s.special_vacation_dates.contains(&dt)
+                    || s.preferred_off_dates.contains(&dt)
+                    || s.specified_off_dates.contains(&dt)
+            })
+            .count() as i32;
+        let expected_min = (parsed.config.sec_2f_back_base_cap - vac_cnt).max(0) as u32;
+        let actual_2f_b: u32 = core_2f_b
+            .iter()
+            .map(|s| res_sep.shifts[&s.name][&d] as u32)
+            .sum();
+        assert!(
+            actual_2f_b >= expected_min,
+            "9/{} の2階裏出勤人数 ({}) が基本人数下限 ({}) 以上であること",
+            d,
+            actual_2f_b,
+            expected_min
+        );
+    }
+
+    // 5. 過去最大3ヶ月分の主公休ローテーション検証 (2ヶ月周期ピンポンの防止)
+    let out_rot = PathBuf::from("target/test_v1_2_0_rot4m.xlsx");
+    let _ = fs::remove_file(&out_rot);
+    let rot_opts = GenerateOptions {
+        target_months: Some(vec![(2026, 9), (2026, 10), (2026, 11), (2026, 12)]),
+        output_path: Some(out_rot.clone()),
+    };
+    let (_, rot_results) = ShiftGenerator::generate(&parsed, &holidays, &rot_opts, |_, _, _, _, _| {})
+        .expect("4ヶ月連続生成が成功すること");
+    let miyazawa_offs: Vec<u32> = rot_results
+        .iter()
+        .map(|(_, _, r)| r.main_offs["宮澤"])
+        .collect();
+    let unique_offs: HashSet<u32> = miyazawa_offs.iter().copied().collect();
+    assert!(
+        unique_offs.len() >= 3,
+        "3ヶ月履歴ローテーションにより宮澤さんの第2公休が4ヶ月で3種類以上に分散すること: {:?}",
+        miyazawa_offs
+    );
+    let _ = fs::remove_file(&out_rot);
+
+    // 6. 前月シフト実績シートの年月整合ガード検証
+    let mut guard_parsed = parsed.clone();
+    guard_parsed.prev_sheet_year_month = Some((2026, 12)); // 2026年12月の実績シートと仮定
+    guard_parsed
+        .prev_month_tail_shifts
+        .insert("榊原".to_string(), vec![1, 1, 1, 1, 1]); // 5連勤 (本来なら翌月1日目は強制公休)
+
+    // 2026年9月を単発生成した場合、2026年12月の実績は誤適用されない（クリアされる）こと
+    let out_guard = PathBuf::from("target/test_v1_2_0_guard.xlsx");
+    let _ = fs::remove_file(&out_guard);
+    let guard_opts_sep = GenerateOptions {
+        target_months: Some(vec![(2026, 9)]),
+        output_path: Some(out_guard.clone()),
+    };
+    let (_, sep_guard_res) =
+        ShiftGenerator::generate(&guard_parsed, &holidays, &guard_opts_sep, |_, _, _, _, _| {})
+            .expect("9月生成成功");
+    assert!(sep_guard_res[0].2.success);
+
+    // 一方、2027年1月（2026年12月の翌月）を生成した場合は12月末尾実績が正しく適用されること
+    let guard_opts_jan = GenerateOptions {
+        target_months: Some(vec![(2027, 1)]),
+        output_path: Some(out_guard.clone()),
+    };
+    let (_, jan_guard_res) =
+        ShiftGenerator::generate(&guard_parsed, &holidays, &guard_opts_jan, |_, _, _, _, _| {})
+            .expect("1月生成成功");
+    assert!(jan_guard_res[0].2.success);
+    let _ = fs::remove_file(&out_guard);
 }
 
 

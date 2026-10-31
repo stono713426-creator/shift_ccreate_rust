@@ -1,7 +1,8 @@
 //! 勤務シフト自動生成システム 二段階数理最適化ソルバー (`solver.rs`)
 //!
-//! Version: v1.1.0
-//! Updated: 2026-10-31 - v1.1.0 ソルバー改善: OPE曜日条件評価順・UTF-8スライス修正、除外スタッフ人数補正、OR型主公休スライド柔軟化、固定公休y変数整合化
+//! Version: v1.2.0
+//! Updated: 2026-11-01 - v1.2.0 全仕様監査対応: 週4×固定1日特別枠対応、2階裏基本人数・ブレ幅・二乗ペナルティ実装、3ヶ月ローテーション履歴、7日ローリング窓・月末公休抑制、3連休有休除外、OPEタイポ吸収、タイムリミット適用
+//! - v1.1.0 (2026-10-31): OPE曜日条件評価順・UTF-8スライス修正、除外スタッフ人数補正、OR型主公休スライド柔軟化、固定公休y変数整合化
 //! - v1.0.0 (2026-10-31): Phase 2 実装: good_lp + HiGHS (MILP) 二段階数理最適化エンジンの完全実装
 //!
 //! SPECIFICATION.md セクション5 に基づく厳密な線形不等式モデルと二段階探索の実装。
@@ -246,7 +247,8 @@ pub fn calculate_target_days(
                 let is_vac = staff.vacation_dates.contains(&date);
                 let is_sp_vac = staff.special_vacation_dates.contains(&date);
                 let is_pref_off = staff.preferred_off_dates.contains(&date);
-                let is_spec_off = staff.specified_off_dates.contains(&date);
+                let is_spec_off =
+                    data.config.specified_off_rule && staff.specified_off_dates.contains(&date);
 
                 if !is_basic_off && !is_vac && !is_sp_vac && !is_pref_off && !is_spec_off {
                     work_days_count += 1;
@@ -261,16 +263,20 @@ pub fn calculate_target_days(
                 common_off_w5
             };
 
-            let spec_off_count = staff
-                .specified_off_dates
-                .iter()
-                .filter(|d| {
-                    d.year() == ctx.year
-                        && d.month() == ctx.month
-                        && d.weekday() != Weekday::Sun
-                        && !holidays.contains_key(d)
-                })
-                .count() as i32;
+            let spec_off_count = if data.config.specified_off_rule {
+                staff
+                    .specified_off_dates
+                    .iter()
+                    .filter(|d| {
+                        d.year() == ctx.year
+                            && d.month() == ctx.month
+                            && d.weekday() != Weekday::Sun
+                            && !holidays.contains_key(d)
+                    })
+                    .count() as i32
+            } else {
+                0
+            };
 
             let sp_vac_count = staff
                 .special_vacation_dates
@@ -389,11 +395,11 @@ pub fn parse_rule_target_dates(
             }
         }
         if kw.is_empty() {
-            if desc_trim.contains("硝子体") || desc_lower.contains("vit") {
+            if desc_trim.contains("硝子体") || desc_lower.contains("vit") || desc_lower.contains("viit") {
                 kw = "vit".to_string();
             } else if desc_trim.contains("下垂") || desc_trim.contains("眼瞼") {
                 kw = "下垂".to_string();
-            } else if desc_trim.contains("白内障") || desc_lower.contains("cat") {
+            } else if desc_trim.contains("白内障") || desc_lower.contains("cat") || desc_lower.contains("cay") {
                 kw = "cat".to_string();
             } else if desc_trim.contains("緑内障") || desc_lower.contains("gla") {
                 kw = "gla".to_string();
@@ -407,10 +413,12 @@ pub fn parse_rule_target_dates(
                 let ope_lower = ope_text.to_lowercase();
                 let matched = if kw.is_empty() {
                     true
-                } else if kw_lower == "vit" || kw == "硝子体" {
-                    ope_lower.contains("vit") || ope_text.contains("硝子体")
-                } else if kw_lower == "cat" || kw == "白内障" {
-                    ope_lower.contains("cat") || ope_text.contains("白内障")
+                } else if kw_lower == "vit" || kw_lower == "viit" || kw == "硝子体" {
+                    // 実データのタイポ ("Viit" 等) も吸収
+                    ope_lower.contains("vit") || ope_lower.contains("viit") || ope_text.contains("硝子体")
+                } else if kw_lower == "cat" || kw_lower == "cay" || kw == "白内障" {
+                    // 実データのタイポ ("cay" 等) も吸収
+                    ope_lower.contains("cat") || ope_lower.contains("cay") || ope_text.contains("白内障")
                 } else if kw_lower == "gla" || kw == "緑内障" {
                     ope_lower.contains("gla") || ope_text.contains("緑内障")
                 } else if kw == "下垂" || kw == "眼瞼" || kw == "眼瞼下垂" {
@@ -519,6 +527,7 @@ fn build_and_solve_stage(
     let mut objective = Expression::from(0.0);
 
     let config = &data.config;
+    let common_sp_vac = compute_common_sp_vac(data, ctx);
 
     // 1. 決定変数 x[s, d] の定義 (s: スタッフ, d: 1..=days_in_month)
     let mut x_vars: HashMap<(String, u32), Variable> = HashMap::new();
@@ -604,7 +613,7 @@ fn build_and_solve_stage(
             && staff.basic_off_type == OffType::And;
 
         if is_week4_fixed_one {
-            // 週4×固定1日指定者 (例: 宮澤さん)
+            // 週4×固定1日指定者 (例: 宮澤さん、石橋さん)
             let fix_w = staff.basic_off_days[0];
             // 固定公休曜日 (診療日) は休み
             for &d in &ctx.clinic_days {
@@ -625,26 +634,40 @@ fn build_and_solve_stage(
                 }
             }
 
-            // 各 ISO 週において、指定公休を含まない週なら原則として第2公休曜日は休み:
-            // x[s, d] + y[s, w] - slide_slack <= 1.0 (5週ある曜日等で所定日数 target と衝突する週のみ1日スライド/免除を許容)
-            for week in &ctx.weeks {
-                let week_has_spec_off = week.days.iter().any(|&d| staff.specified_off_dates.contains(&ctx.date_map[&d]));
-                if !week_has_spec_off {
-                    for &d in &week.clinic_days {
-                        let w = ctx.weekday_map[&d];
-                        if candidates.contains(&w) {
-                            let slide_slack = vars.add(variable().min(0.0));
-                            constraints.push(constraint!(
-                                x_vars[&(s_name.clone(), d)] + y_vars[&(s_name.clone(), w)] - slide_slack <= 1.0
-                            ));
-                            objective += slide_slack * WEIGHT_MAIN_OFF_SLIDE_SLACK as f64;
+            // 通常週4スタッフ（特別枠でない場合）は、指定公休を含まない各ISO週において原則として第2公休曜日は休み:
+            // x[s, d] + y[s, w] - slide_slack <= 1.0
+            // ※ 「必要に応じて週5日可」(is_special) の場合は第2公休日の出勤により週5勤務へ拡張するため slide_slack で阻害しない
+            if !staff.is_special {
+                for week in &ctx.weeks {
+                    let week_has_spec_off = config.specified_off_rule
+                        && week
+                            .days
+                            .iter()
+                            .any(|&d| staff.specified_off_dates.contains(&ctx.date_map[&d]));
+                    if !week_has_spec_off {
+                        for &d in &week.clinic_days {
+                            let w = ctx.weekday_map[&d];
+                            if candidates.contains(&w) {
+                                let slide_slack = vars.add(variable().min(0.0));
+                                constraints.push(constraint!(
+                                    x_vars[&(s_name.clone(), d)] + y_vars[&(s_name.clone(), w)] - slide_slack <= 1.0
+                                ));
+                                objective += slide_slack * WEIGHT_MAIN_OFF_SLIDE_SLACK as f64;
+                            }
                         }
                     }
                 }
             }
 
-            // 月間出勤数: target
-            if stage == 1 {
+            // 月間出勤数
+            if staff.is_special {
+                // 「必要に応じて週5日可」スタッフ (例: 石橋さん): target 以上、最大 target+5
+                constraints.push(constraint!(month_work_sum.clone() >= target as f64));
+                let extra_work = vars.add(variable().min(0.0));
+                constraints.push(constraint!(month_work_sum.clone() - extra_work <= target as f64));
+                constraints.push(constraint!(month_work_sum <= (target + 5) as f64));
+                objective += extra_work * WEIGHT_SPECIAL_EXTRA_WORK as f64;
+            } else if stage == 1 {
                 constraints.push(constraint!(month_work_sum == target as f64));
             } else {
                 let slack_under = vars.add(variable().min(0.0));
@@ -675,11 +698,19 @@ fn build_and_solve_stage(
             constraints.push(constraint!(month_work_sum.clone() <= target as f64));
 
             // 不足許容スラック
-            let spec_off_cnt = staff
-                .specified_off_dates
-                .iter()
-                .filter(|d| d.year() == ctx.year && d.month() == ctx.month && !ctx.is_holiday_map.get(&(d.day())).cloned().unwrap_or(false))
-                .count() as i32;
+            let spec_off_cnt = if config.specified_off_rule {
+                staff
+                    .specified_off_dates
+                    .iter()
+                    .filter(|d| {
+                        d.year() == ctx.year
+                            && d.month() == ctx.month
+                            && !ctx.is_holiday_map.get(&(d.day())).cloned().unwrap_or(false)
+                    })
+                    .count() as i32
+            } else {
+                0
+            };
             let min_allowed = (target - config.fixed_off_shortage_allowance - spec_off_cnt).max(0);
 
             let slack_fixed_shortage = vars.add(variable().min(0.0));
@@ -709,17 +740,24 @@ fn build_and_solve_stage(
 
             // 各 ISO 週において、指定公休を含まない週なら原則として主公休曜日は休み:
             // x[s, d] + y[s, w] - slide_slack <= 1.0 (HIGH1/HIGH2等の高優先制約と競合する週のみ一時スライドを許容)
-            for week in &ctx.weeks {
-                let week_has_spec_off = week.days.iter().any(|&d| staff.specified_off_dates.contains(&ctx.date_map[&d]));
-                if !week_has_spec_off {
-                    for &d in &week.clinic_days {
-                        let w = ctx.weekday_map[&d];
-                        if candidates.contains(&w) {
-                            let slide_slack = vars.add(variable().min(0.0));
-                            constraints.push(constraint!(
-                                x_vars[&(s_name.clone(), d)] + y_vars[&(s_name.clone(), w)] - slide_slack <= 1.0
-                            ));
-                            objective += slide_slack * WEIGHT_MAIN_OFF_SLIDE_SLACK as f64;
+            // ※ 「必要に応じて週5日可」(is_special) の場合は主公休日の出勤により週5勤務へ拡張するため slide_slack で阻害しない
+            if !staff.is_special {
+                for week in &ctx.weeks {
+                    let week_has_spec_off = config.specified_off_rule
+                        && week
+                            .days
+                            .iter()
+                            .any(|&d| staff.specified_off_dates.contains(&ctx.date_map[&d]));
+                    if !week_has_spec_off {
+                        for &d in &week.clinic_days {
+                            let w = ctx.weekday_map[&d];
+                            if candidates.contains(&w) {
+                                let slide_slack = vars.add(variable().min(0.0));
+                                constraints.push(constraint!(
+                                    x_vars[&(s_name.clone(), d)] + y_vars[&(s_name.clone(), w)] - slide_slack <= 1.0
+                                ));
+                                objective += slide_slack * WEIGHT_MAIN_OFF_SLIDE_SLACK as f64;
+                            }
                         }
                     }
                 }
@@ -783,13 +821,27 @@ fn build_and_solve_stage(
             constraints.push(constraint!(sum_expr <= max_k as f64));
         }
 
-        // 5. 3連休抑制制約 (診療日ベース)
+        // 5. 3連休抑制制約 (診療日ベース、有休・特別有休・休診日を除く通常の公休3連休を抑制)
         let consec_weight = config.consecutive_off_weight();
-        if consec_weight > 0 && ctx.clinic_days.len() >= 3 {
-            for i in 0..ctx.clinic_days.len() - 2 {
-                let d1 = ctx.clinic_days[i];
-                let d2 = ctx.clinic_days[i + 1];
-                let d3 = ctx.clinic_days[i + 2];
+        let active_c_days_for_consec: Vec<u32> = ctx
+            .clinic_days
+            .iter()
+            .copied()
+            .filter(|&d| !common_sp_vac.contains(&ctx.date_map[&d]))
+            .collect();
+        if consec_weight > 0 && active_c_days_for_consec.len() >= 3 {
+            for i in 0..active_c_days_for_consec.len() - 2 {
+                let d1 = active_c_days_for_consec[i];
+                let d2 = active_c_days_for_consec[i + 1];
+                let d3 = active_c_days_for_consec[i + 2];
+
+                let has_vac_in_triple = [d1, d2, d3].iter().any(|&d| {
+                    let dt = ctx.date_map[&d];
+                    staff.vacation_dates.contains(&dt) || staff.special_vacation_dates.contains(&dt)
+                });
+                if has_vac_in_triple {
+                    continue;
+                }
 
                 let o_slack = vars.add(variable().min(0.0));
                 // o_slack >= 1 - (x1 + x2 + x3)
@@ -804,13 +856,14 @@ fn build_and_solve_stage(
             }
         }
 
-        // 6. 主公休不一致ペナルティ (有休・特有・指定公休・固定公休を除く診療日)
+        // 6. 主公休不一致ペナルティ (有休・特有・指定公休・固定公休・共通休診日を除く診療日)
         if staff.is_core && staff.pattern != "除外" {
             for &d in &ctx.clinic_days {
                 let date = ctx.date_map[&d];
                 let w = ctx.weekday_map[&d];
 
-                let is_exempt = staff.vacation_dates.contains(&date)
+                let is_exempt = common_sp_vac.contains(&date)
+                    || staff.vacation_dates.contains(&date)
                     || staff.special_vacation_dates.contains(&date)
                     || (config.specified_off_rule && staff.specified_off_dates.contains(&date))
                     || (is_week4_fixed_one && staff.basic_off_days.contains(&w));
@@ -825,40 +878,136 @@ fn build_and_solve_stage(
                 }
             }
 
-            // 過去主公休ローテーションペナルティ (前月実績からの主公休引き継ぎ抑制: AND固定公休者は対象外)
+            // 過去最大3ヶ月分の主公休ローテーション減衰ペナルティ (AND固定公休者は対象外)
             let is_pure_fixed_and = staff.basic_off_type == OffType::And
                 && !staff.basic_off_days.is_empty()
                 && !is_week4_fixed_one;
             if !is_pure_fixed_and {
-                if let Some(&prev_w) = data.prev_month_main_offs.get(s_name) {
-                    if prev_w <= 5 {
-                        let rot_weight = if is_week4_fixed_one {
-                            WEIGHT_PREV_OFF_REPEAT * 40 // 12,000,000
-                        } else {
-                            WEIGHT_PREV_OFF_REPEAT * 4 // 1,200,000
-                        };
+                let fallback_vec: Vec<u32> = data
+                    .prev_month_main_offs
+                    .get(s_name)
+                    .copied()
+                    .into_iter()
+                    .collect();
+                let history: &[u32] = match data.prev_month_main_offs_history.get(s_name) {
+                    Some(h) if !h.is_empty() => h.as_slice(),
+                    _ => fallback_vec.as_slice(),
+                };
+                let multipliers: [i64; 3] = if is_week4_fixed_one {
+                    [40, 20, 10] // [12,000,000, 6,000,000, 3,000,000]
+                } else {
+                    [4, 2, 1] // [1,200,000, 600,000, 300,000]
+                };
+                let mut seen_w = HashSet::new();
+                for (idx, &prev_w) in history.iter().take(3).enumerate() {
+                    if prev_w <= 5 && seen_w.insert(prev_w) {
+                        let rot_weight = WEIGHT_PREV_OFF_REPEAT * multipliers[idx];
                         objective += y_vars[&(s_name.clone(), prev_w)] * rot_weight as f64;
                     }
                 }
             }
         }
 
-        // 7. 週単位の公休平準化制約 (weekly_off_balance_rule)
-        if config.weekly_off_balance_rule && staff.is_core && staff.pattern != "除外" {
-            for week in &ctx.weeks {
-                // ISO週の公休日数: |week| - sum(x)
-                let week_days_count = week.days.len() as f64;
-                let sum_work: Expression = week.days.iter().map(|&d| x_vars[&(s_name.clone(), d)]).sum();
-                let target_off = config.weekly_off_target as f64;
+        // 7. 週単位の公休平準化・7日ローリングウィンドウ・月末公休偏り抑制
+        if staff.is_core && staff.pattern != "除外" {
+            if config.weekly_off_balance_rule {
+                // 7a. ISO週単位の公休平準化 (月端の5稼働日未満の端数週や休診週は除外)
+                let base_w5_c_off = (config.weekly_off_target - 1).max(0);
+                for week in &ctx.weeks {
+                    let active_c_days: Vec<u32> = week
+                        .clinic_days
+                        .iter()
+                        .copied()
+                        .filter(|&d| !common_sp_vac.contains(&ctx.date_map[&d]))
+                        .collect();
+                    if active_c_days.len() < 5 {
+                        continue;
+                    }
 
-                let u_abs = vars.add(variable().min(0.0));
-                let u_abs_expr = Expression::from(u_abs);
-                // u_abs >= (week_days - sum_work) - target_off
-                constraints.push(constraint!(u_abs_expr.clone() + sum_work.clone() >= week_days_count - target_off));
-                // u_abs >= target_off - (week_days - sum_work)
-                constraints.push(constraint!(u_abs_expr - sum_work >= target_off - week_days_count));
+                    let c_len = active_c_days.len() as f64;
+                    let sum_work_c: Expression = active_c_days
+                        .iter()
+                        .map(|&d| x_vars[&(s_name.clone(), d)])
+                        .sum();
 
-                objective += u_abs * WEIGHT_WEEKLY_OFF_DIFF as f64;
+                    let target_c_off = if staff.pattern.contains("週4") && !staff.is_special {
+                        let fri_sat_cnt = active_c_days
+                            .iter()
+                            .filter(|&&d| matches!(ctx.weekday_map[&d], 4 | 5))
+                            .count();
+                        if fri_sat_cnt >= 2 {
+                            (base_w5_c_off + 1) as f64
+                        } else {
+                            base_w5_c_off.max(1) as f64
+                        }
+                    } else {
+                        base_w5_c_off.max(1) as f64
+                    };
+
+                    let u_abs = vars.add(variable().min(0.0));
+                    let u_abs_expr = Expression::from(u_abs);
+                    // u_abs >= (c_len - sum_work_c) - target_c_off
+                    constraints.push(constraint!(
+                        u_abs_expr.clone() + sum_work_c.clone() >= c_len - target_c_off
+                    ));
+                    // u_abs >= target_c_off - (c_len - sum_work_c)
+                    constraints.push(constraint!(
+                        u_abs_expr - sum_work_c >= target_c_off - c_len
+                    ));
+
+                    objective += u_abs * WEIGHT_WEEKLY_OFF_DIFF as f64;
+                }
+
+                // 7b. 7暦日ローリングウィンドウ平準化 (WEIGHT_ROLLING_WINDOW_DIFF)
+                if ctx.days_in_month >= 7 {
+                    let rolling_target_off = if staff.pattern.contains("週4") && !staff.is_special {
+                        (config.weekly_off_target + 1) as f64
+                    } else {
+                        config.weekly_off_target as f64
+                    };
+                    for start_d in 1..=(ctx.days_in_month - 6) {
+                        let has_closure = (start_d..=start_d + 6)
+                            .any(|d| common_sp_vac.contains(&ctx.date_map[&d]));
+                        if has_closure {
+                            continue;
+                        }
+                        let win_work: Expression = (start_d..=start_d + 6)
+                            .map(|d| x_vars[&(s_name.clone(), d)])
+                            .sum();
+                        let r_abs = vars.add(variable().min(0.0));
+                        let r_abs_expr = Expression::from(r_abs);
+                        constraints.push(constraint!(
+                            r_abs_expr.clone() + win_work.clone() >= 7.0 - rolling_target_off
+                        ));
+                        constraints.push(constraint!(
+                            r_abs_expr - win_work >= rolling_target_off - 7.0
+                        ));
+                        objective += r_abs * WEIGHT_ROLLING_WINDOW_DIFF as f64;
+                    }
+                }
+            }
+
+            // 7c. 月末3稼働日の公休集中抑制 (WEIGHT_TAIL_OFF_SUM)
+            let tail_clinic_days: Vec<u32> = ctx
+                .clinic_days
+                .iter()
+                .copied()
+                .filter(|&d| !common_sp_vac.contains(&ctx.date_map[&d]))
+                .rev()
+                .take(3)
+                .collect();
+            for d in tail_clinic_days {
+                let date = ctx.date_map[&d];
+                let w = ctx.weekday_map[&d];
+                let is_forced_off = staff.vacation_dates.contains(&date)
+                    || staff.special_vacation_dates.contains(&date)
+                    || staff.preferred_off_dates.contains(&date)
+                    || (config.specified_off_rule && staff.specified_off_dates.contains(&date))
+                    || (staff.basic_off_type == OffType::And && staff.basic_off_days.contains(&w));
+                if !is_forced_off {
+                    objective += (Expression::from(1.0) - x_vars[&(s_name.clone(), d)])
+                        * WEIGHT_TAIL_OFF_SUM as f64;
+                }
             }
         }
 
@@ -881,18 +1030,36 @@ fn build_and_solve_stage(
         }
     }
 
-    // 9. セクション出勤人数の平準化とペナルティ (全員共通特別有休の休診日は除外)
-    let common_sp_vac = compute_common_sp_vac(data, ctx);
+    // 9. セクション出勤人数の平準化・許容ブレ幅・基本人数とペナルティ (全員共通特別有休の休診日は除外)
+    let staffs_1f: Vec<&Staff> = data
+        .staffs
+        .iter()
+        .filter(|s| s.section == "1階" && s.pattern != "除外")
+        .collect();
+    let staffs_2f_front: Vec<&Staff> = data
+        .staffs
+        .iter()
+        .filter(|s| s.section == "2階表" && s.is_core && s.pattern != "除外")
+        .collect();
+    let core_2f_back: Vec<&Staff> = data
+        .staffs
+        .iter()
+        .filter(|s| s.section == "2階裏" && s.is_core && s.pattern != "除外")
+        .collect();
+    let num_core_2f_b = core_2f_back.len();
+
     for &d in &ctx.clinic_days {
         let date = ctx.date_map[&d];
         if common_sp_vac.contains(&date) {
             continue;
         }
-        // 1階
-        let sum_1f: Expression = data
-            .staffs
+        let w = ctx.weekday_map[&d];
+
+        // --------------------------------------------------------------------
+        // (A) 1階: 絶対偏差 + 二乗偏差 + 許容ブレ幅 (sec_capacity_tolerance) + 6名以下ペナルティ
+        // --------------------------------------------------------------------
+        let sum_1f: Expression = staffs_1f
             .iter()
-            .filter(|s| s.section == "1階" && s.pattern != "除外")
             .map(|s| x_vars[&(s.name.clone(), d)])
             .sum();
 
@@ -901,8 +1068,55 @@ fn build_and_solve_stage(
             let u_abs = vars.add(variable().min(0.0));
             let u_abs_expr = Expression::from(u_abs);
             constraints.push(constraint!(u_abs_expr.clone() + sum_1f.clone() >= m_round));
-            constraints.push(constraint!(u_abs_expr - sum_1f.clone() >= -m_round));
+            constraints.push(constraint!(u_abs_expr.clone() - sum_1f.clone() >= -m_round));
             objective += u_abs * WEIGHT_SEC_BALANCE_ABS as f64;
+
+            // 二乗偏差 q_dev = u_abs^2 (整数凸区分線形表現)
+            let max_dev_1f = staffs_1f.len().max(1);
+            let q_dev_1f = vars.add(variable().min(0.0));
+            let q_dev_1f_expr = Expression::from(q_dev_1f);
+            for m in 1..=max_dev_1f {
+                let slope = (2 * m - 1) as f64;
+                let intercept = (m * (m - 1)) as f64;
+                constraints.push(constraint!(
+                    q_dev_1f_expr.clone() - u_abs_expr.clone() * slope >= -intercept
+                ));
+            }
+            objective += q_dev_1f * WEIGHT_SEC_BALANCE_SQ as f64;
+
+            // セクション人数ブレ幅 (sec_capacity_tolerance) 逸脱スラックペナルティ
+            let vac_1f_on_d = staffs_1f
+                .iter()
+                .filter(|s| {
+                    s.vacation_dates.contains(&date)
+                        || s.special_vacation_dates.contains(&date)
+                        || s.preferred_off_dates.contains(&date)
+                        || (config.specified_off_rule && s.specified_off_dates.contains(&date))
+                })
+                .count();
+            let avail_1f_on_d = staffs_1f
+                .iter()
+                .filter(|s| {
+                    let fv = s.vacation_dates.contains(&date)
+                        || s.special_vacation_dates.contains(&date)
+                        || s.preferred_off_dates.contains(&date)
+                        || (config.specified_off_rule && s.specified_off_dates.contains(&date));
+                    let fb = (s.basic_off_type == OffType::And || !s.is_core)
+                        && s.basic_off_days.contains(&w);
+                    !fv && !fb
+                })
+                .count();
+            let min_1f = (mean_1f.floor()
+                - config.sec_capacity_tolerance as f64
+                - vac_1f_on_d as f64)
+                .max(0.0)
+                .min(avail_1f_on_d as f64);
+            let max_1f = mean_1f.ceil() + config.sec_capacity_tolerance as f64;
+            let slack_1f_under = vars.add(variable().min(0.0));
+            let slack_1f_over = vars.add(variable().min(0.0));
+            constraints.push(constraint!(sum_1f.clone() + slack_1f_under >= min_1f));
+            constraints.push(constraint!(sum_1f.clone() - slack_1f_over <= max_1f));
+            objective += (slack_1f_under + slack_1f_over) * WEIGHT_GENERAL_SEC_SLACK as f64;
 
             // 1階 6名以下ペナルティ (mean_1f >= 6.5 のとき K <= 6 に 1.5M ペナルティ)
             if mean_1f >= 6.5 {
@@ -913,11 +1127,11 @@ fn build_and_solve_stage(
             }
         }
 
-        // 2階表
-        let sum_2f_front: Expression = data
-            .staffs
+        // --------------------------------------------------------------------
+        // (B) 2階表: 絶対偏差 + 二乗偏差 + 許容ブレ幅 (sec_capacity_tolerance)
+        // --------------------------------------------------------------------
+        let sum_2f_front: Expression = staffs_2f_front
             .iter()
-            .filter(|s| s.section == "2階表" && s.is_core && s.pattern != "除外")
             .map(|s| x_vars[&(s.name.clone(), d)])
             .sum();
 
@@ -926,18 +1140,62 @@ fn build_and_solve_stage(
             let u_abs = vars.add(variable().min(0.0));
             let u_abs_expr = Expression::from(u_abs);
             constraints.push(constraint!(u_abs_expr.clone() + sum_2f_front.clone() >= m_round));
-            constraints.push(constraint!(u_abs_expr - sum_2f_front.clone() >= -m_round));
+            constraints.push(constraint!(u_abs_expr.clone() - sum_2f_front.clone() >= -m_round));
             objective += u_abs * WEIGHT_SEC_BALANCE_ABS as f64;
+
+            // 二乗偏差 q_dev = u_abs^2
+            let max_dev_2f_f = staffs_2f_front.len().max(1);
+            let q_dev_2f_f = vars.add(variable().min(0.0));
+            let q_dev_2f_f_expr = Expression::from(q_dev_2f_f);
+            for m in 1..=max_dev_2f_f {
+                let slope = (2 * m - 1) as f64;
+                let intercept = (m * (m - 1)) as f64;
+                constraints.push(constraint!(
+                    q_dev_2f_f_expr.clone() - u_abs_expr.clone() * slope >= -intercept
+                ));
+            }
+            objective += q_dev_2f_f * WEIGHT_SEC_BALANCE_SQ as f64;
+
+            // セクション人数ブレ幅 (sec_capacity_tolerance) 逸脱スラックペナルティ
+            let vac_2f_f_on_d = staffs_2f_front
+                .iter()
+                .filter(|s| {
+                    s.vacation_dates.contains(&date)
+                        || s.special_vacation_dates.contains(&date)
+                        || s.preferred_off_dates.contains(&date)
+                        || (config.specified_off_rule && s.specified_off_dates.contains(&date))
+                })
+                .count();
+            let avail_2f_f_on_d = staffs_2f_front
+                .iter()
+                .filter(|s| {
+                    let fv = s.vacation_dates.contains(&date)
+                        || s.special_vacation_dates.contains(&date)
+                        || s.preferred_off_dates.contains(&date)
+                        || (config.specified_off_rule && s.specified_off_dates.contains(&date));
+                    let fb = s.basic_off_type == OffType::And && s.basic_off_days.contains(&w);
+                    !fv && !fb
+                })
+                .count();
+            let min_2f_f = (mean_2f_f.floor()
+                - config.sec_capacity_tolerance as f64
+                - vac_2f_f_on_d as f64)
+                .max(0.0)
+                .min(avail_2f_f_on_d as f64);
+            let max_2f_f = mean_2f_f.ceil() + config.sec_capacity_tolerance as f64;
+            let slack_2f_f_under = vars.add(variable().min(0.0));
+            let slack_2f_f_over = vars.add(variable().min(0.0));
+            constraints.push(constraint!(sum_2f_front.clone() + slack_2f_f_under >= min_2f_f));
+            constraints.push(constraint!(sum_2f_front - slack_2f_f_over <= max_2f_f));
+            objective += (slack_2f_f_under + slack_2f_f_over) * WEIGHT_GENERAL_SEC_SLACK as f64;
         }
 
-        // 2階裏 (コアスタッフ)
-        let core_2f_back: Vec<&Staff> = data
-            .staffs
+        // --------------------------------------------------------------------
+        // (C) 2階裏 (コアスタッフ): 絶対偏差 + 二乗偏差 + 2階裏_基本人数 + 3名/5名ペナルティ
+        // --------------------------------------------------------------------
+        let sum_2f_back: Expression = core_2f_back
             .iter()
-            .filter(|s| s.section == "2階裏" && s.is_core && s.pattern != "除外")
-            .collect();
-        let num_core_2f_b = core_2f_back.len();
-        let sum_2f_back: Expression = core_2f_back.iter().map(|s| x_vars[&(s.name.clone(), d)])
+            .map(|s| x_vars[&(s.name.clone(), d)])
             .sum();
 
         if let Some(&mean_2f_b) = ideal_mean.get("2階裏") {
@@ -945,8 +1203,57 @@ fn build_and_solve_stage(
             let u_abs = vars.add(variable().min(0.0));
             let u_abs_expr = Expression::from(u_abs);
             constraints.push(constraint!(u_abs_expr.clone() + sum_2f_back.clone() >= m_round));
-            constraints.push(constraint!(u_abs_expr - sum_2f_back.clone() >= -m_round));
+            constraints.push(constraint!(u_abs_expr.clone() - sum_2f_back.clone() >= -m_round));
             objective += u_abs * WEIGHT_SEC_BALANCE_ABS as f64;
+
+            // 二乗偏差 q_dev = u_abs^2 (平均 m_round 中心のため特別枠の出勤増を不当に阻害しない)
+            let max_dev_2f_b = num_core_2f_b.max(1);
+            let q_dev_2f_b = vars.add(variable().min(0.0));
+            let q_dev_2f_b_expr = Expression::from(q_dev_2f_b);
+            for m in 1..=max_dev_2f_b {
+                let slope = (2 * m - 1) as f64;
+                let intercept = (m * (m - 1)) as f64;
+                constraints.push(constraint!(
+                    q_dev_2f_b_expr.clone() - u_abs_expr.clone() * slope >= -intercept
+                ));
+            }
+            objective += q_dev_2f_b * WEIGHT_SEC_BALANCE_SQ as f64;
+        }
+
+        // 2階裏_基本人数 (sec_2f_back_base_cap = 3) の日次最低人数制約
+        if num_core_2f_b > 0 && config.sec_2f_back_base_cap > 0 {
+            let vac_2f_b_on_d = core_2f_back
+                .iter()
+                .filter(|s| {
+                    s.vacation_dates.contains(&date)
+                        || s.special_vacation_dates.contains(&date)
+                        || s.preferred_off_dates.contains(&date)
+                        || (config.specified_off_rule && s.specified_off_dates.contains(&date))
+                })
+                .count() as i32;
+            let avail_2f_b_on_d = core_2f_back
+                .iter()
+                .filter(|s| {
+                    let fv = s.vacation_dates.contains(&date)
+                        || s.special_vacation_dates.contains(&date)
+                        || s.preferred_off_dates.contains(&date)
+                        || (config.specified_off_rule && s.specified_off_dates.contains(&date));
+                    let fb = s.basic_off_type == OffType::And && s.basic_off_days.contains(&w);
+                    !fv && !fb
+                })
+                .count() as i32;
+            let eff_2f_min = (config.sec_2f_back_base_cap - vac_2f_b_on_d)
+                .max(0)
+                .min(avail_2f_b_on_d) as f64;
+            if eff_2f_min > 0.0 {
+                if stage == 1 {
+                    constraints.push(constraint!(sum_2f_back.clone() >= eff_2f_min));
+                } else {
+                    let b2_slack = vars.add(variable().min(0.0));
+                    constraints.push(constraint!(sum_2f_back.clone() + b2_slack >= eff_2f_min));
+                    objective += b2_slack * WEIGHT_2F_BACK_MIN_SLACK as f64;
+                }
+            }
         }
 
         // 2階裏 人数ワンホット変数 delta[v] (v in 0..=num_core_2f_b)
@@ -1156,10 +1463,12 @@ fn build_and_solve_stage(
             if let Some(staff_shifts) = existing_month_shifts.get(&staff.name) {
                 for &d in &ctx.clinic_days {
                     let date = ctx.date_map[&d];
-                    // 有休・特有・指定公休は除外
-                    if staff.vacation_dates.contains(&date)
+                    // 共通休診・有休・特有・希望休・指定公休は除外
+                    if common_sp_vac.contains(&date)
+                        || staff.vacation_dates.contains(&date)
                         || staff.special_vacation_dates.contains(&date)
-                        || staff.specified_off_dates.contains(&date)
+                        || staff.preferred_off_dates.contains(&date)
+                        || (config.specified_off_rule && staff.specified_off_dates.contains(&date))
                     {
                         continue;
                     }
@@ -1186,6 +1495,7 @@ fn build_and_solve_stage(
     ));
 
     let mut model = vars.minimise(objective).using(default_solver);
+    model = model.set_option("time_limit", SOLVER_TIME_LIMIT_SECS);
     for c in constraints {
         model.add_constraint(c);
     }
