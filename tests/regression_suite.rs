@@ -1,7 +1,8 @@
 //! 勤務シフト自動生成システム 統合回帰テストスイート (`tests/regression_suite.rs`)
 //!
-//! Version: v1.2.0
-//! Updated: 2026-11-01 - v1.2.0 全仕様監査テスト追加: test_12 石橋特別枠・2階裏基本人数・3ヶ月ローテーション・OPEタイポ吸収・年跨ぎ年補完・前月実績年月ガード検証
+//! Version: v1.2.1
+//! Updated: 2026-11-05 - v1.2.1 標準開発条件表として「勤務条件表_ひな形.xlsx」を採用
+//! - v1.2.0 (2026-11-01): test_12 石橋特別枠・2階裏基本人数・3ヶ月ローテーション・OPEタイポ吸収・年跨ぎ年補完・前月実績年月ガード検証
 //! - v1.1.0 (2026-10-31): test_11 制約条件パース・除外スタッフ補正・主公休スライド・金曜HIGH1の3名体制検証
 //! - v1.0.1 (2026-10-31): test_10 小島さん11月特別有休パース・反映・Excel出力検証追加
 //! - test_01_holidays: 祝日計算・春分秋分・国民の休日・振替休日検証
@@ -28,19 +29,21 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// テスト用実データExcelのパースヘルパー
+/// テスト用標準条件表Excel (`勤務条件表_ひな形.xlsx`) のパースヘルパー
 fn load_test_excel() -> (ParsedExcelData, HashMap<NaiveDate, String>) {
-    let excel_path = if Path::new("勤務条件表_9.xlsx").exists() {
+    let excel_path = if Path::new("勤務条件表_ひな形.xlsx").exists() {
+        "勤務条件表_ひな形.xlsx"
+    } else if Path::new("勤務条件表_9.xlsx").exists() {
         "勤務条件表_9.xlsx"
     } else if Path::new("勤務条件表_9月.xlsx").exists() {
         "勤務条件表_9月.xlsx"
     } else {
-        panic!("実データExcel (勤務条件表_9.xlsx) が見つかりません。");
+        panic!("標準条件表Excel (勤務条件表_ひな形.xlsx) が見つかりません。");
     };
 
     let holidays = get_holidays(2026, 2027);
     let parsed = parse_shift_excel(excel_path, &holidays)
-        .expect("実データExcelのパースに失敗しました");
+        .expect("標準条件表Excelのパースに失敗しました");
     (parsed, holidays)
 }
 
@@ -596,7 +599,7 @@ fn test_11_friday_high1_and_rule_priority_v1_1_0() {
     let vit_days = parse_rule_target_dates("「Vit」手術日", &ctx_jan, &parsed.ope_dict);
     assert!(
         vit_days.contains(&6),
-        "実データ 2027-01-06 ('Viit,cat') も「Vit」手術日として抽出されること"
+        "標準条件表 2027-01-06 ('Vit,cat') が「Vit」手術日として抽出されること"
     );
     for &d in &vit_days {
         let date = ctx_jan.date_map[&d];
@@ -884,6 +887,25 @@ fn test_12_full_spec_audit_v1_2_0() {
             .expect("1月生成成功");
     assert!(jan_guard_res[0].2.success);
     let _ = fs::remove_file(&out_guard);
+
+    // 7. 標準条件表 (勤務条件表_ひな形.xlsx) の構造整合検証
+    assert_eq!(
+        parsed.staffs.len(),
+        25,
+        "標準ひな形の有効スタッフ数が25名（並木さん含む、除外フラグの高橋・森川さん除く）であること"
+    );
+    assert!(
+        parsed
+            .staffs
+            .iter()
+            .any(|s| s.name == "並木" && s.employment == "パート社員" && s.is_core),
+        "標準ひな形にパート社員（コアスタッフ）の並木さんが含まれること"
+    );
+    assert!(
+        !parsed.staffs.iter().any(|s| s.name == "高橋" || s.name == "森川"),
+        "除外フラグ=True のスタッフ（高橋・森川）が除外されていること"
+    );
+    assert_eq!(parsed.rules.len(), 12, "標準ひな形のシフト制約条件が12件であること");
 }
 
 

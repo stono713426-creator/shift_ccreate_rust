@@ -1,7 +1,8 @@
 //! Windows 実行ファイル (.exe) へのバージョン情報リソース自動埋め込みスクリプト
 //!
-//! Version: v1.0.0
-//! Updated: 2026-10-31 - Cargo.toml の version から自動的に FileVersion / ProductVersion を埋め込む初期構築
+//! Version: v1.2.1
+//! Updated: 2026-11-05 - v1.2.1 windres プリプロセッサに LLVM clang.exe フォールバックを追加（Windows Smart App Control 対応）
+//! - v1.0.0 (2026-10-31): Cargo.toml の version から自動的に FileVersion / ProductVersion を埋め込む初期構築
 
 use std::env;
 use std::fs;
@@ -57,8 +58,11 @@ END
 
     let windres_candidates = [
         "windres.exe",
+        r"C:\Users\stono\AppData\Local\Microsoft\WinGet\Packages\BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe\mingw64\bin\windres.exe",
         r"C:\Users\stono\AppData\Local\Programs\mingw64\bin\windres.exe",
     ];
+
+    let clang_pp = r"C:\Program Files\LLVM\bin\clang.exe";
 
     for bin in windres_candidates {
         if let Ok(status) = Command::new(bin)
@@ -76,6 +80,30 @@ END
             if status.success() {
                 println!("cargo:rustc-link-arg-bins={}", obj_path.display());
                 return;
+            }
+        }
+
+        if PathBuf::from(clang_pp).exists() {
+            if let Ok(status) = Command::new(bin)
+                .args([
+                    &format!("--preprocessor={clang_pp}"),
+                    "--preprocessor-arg=-E",
+                    "--preprocessor-arg=-xc-header",
+                    "--preprocessor-arg=-DRC_INVOKED",
+                    "-c",
+                    "65001",
+                    rc_path.to_str().unwrap(),
+                    "-O",
+                    "coff",
+                    "-o",
+                    obj_path.to_str().unwrap(),
+                ])
+                .status()
+            {
+                if status.success() {
+                    println!("cargo:rustc-link-arg-bins={}", obj_path.display());
+                    return;
+                }
             }
         }
     }

@@ -1,7 +1,7 @@
 # 勤務シフト自動生成システム (Rust Edition) 完全移植仕様書
 
-- **Version**: `v1.2.0`
-- **Last Updated**: `2026-11-01`
+- **Version**: `v1.2.1`
+- **Last Updated**: `2026-11-05`
 - **移植元リファレンス**: `C:\Users\stono\projects\sift_create` (`v1.9.1`)
 
 本書は、Python版 `sift_create` (`v1.9.1`) の全仕様・定数・数理制約・日付パース規則・Excel入出力フォーマット・GUI仕様を **1つも漏らさず 100% 純Rustで再現するためのマスター仕様書** です。
@@ -16,7 +16,9 @@ shift_create_rust/
 ├── build.rs                    # Windows EXE バージョンリソース自動埋め込み (windres)
 ├── SPECIFICATION.md            # 本仕様書（全ルール・数式・書式の完全定義）
 ├── README.md                   # プロジェクト概要・ビルド手順
-├── 勤務条件表_9月.xlsx          # 実データ検証用マスターフィクスチャ
+├── 勤務条件表_ひな形.xlsx       # 開発・テスト標準条件表および配布同梱マスターひな形
+├── examples/
+│   └── generate_template.rs    # 勤務条件表_ひな形.xlsx 自動生成ツール
 ├── src/
 │   ├── lib.rs                  # ライブラリルート (shift_core)
 │   ├── main.rs                 # GUI / CLI 統合エントリーポイント
@@ -28,7 +30,7 @@ shift_create_rust/
 │   ├── generator.rs            # [Phase 3] 複数月連続生成・月跨ぎ実績引き継ぎサービス
 │   └── gui.rs                  # [Phase 4] eframe/egui デスクトップGUI (非同期進捗・ログ)
 └── tests/
-    └── regression_suite.rs     # [Phase 1-3] Python版全7項目に対応する統合回帰テスト
+    └── regression_suite.rs     # [Phase 1-3] 全12項目の統合回帰テストスイート
 ```
 
 ---

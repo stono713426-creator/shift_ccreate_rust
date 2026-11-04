@@ -1,7 +1,8 @@
 //! 勤務シフト自動生成システム デスクトップ GUI (`gui.rs`)
 //!
-//! Version: v1.2.0
-//! Updated: 2026-11-01 - v1.2.0 バージョン同期・全設定完全適用対応
+//! Version: v1.2.1
+//! Updated: 2026-11-05 - v1.2.1 標準条件表（勤務条件表_ひな形.xlsx）の自動検出優先度整備
+//! - v1.2.0 (2026-11-01): バージョン同期・全設定完全適用対応
 //! - v1.0.0 (2026-10-31): Phase 4 実装: eframe / egui によるモダンデスクトップ GUI の完全実装
 //!
 //! - Windows 標準日本語フォント（メイリオ / 游ゴシック）自動ロード
@@ -530,7 +531,13 @@ impl eframe::App for ShiftApp {
 }
 
 /// カレントディレクトリから勤務条件表Excelを自動検出する
+///
+/// 優先順位:
+/// 1. ユーザーが作成したカスタム勤務条件表 (`勤務条件表_ひな形.xlsx` および旧検証用 `勤務条件表_9*.xlsx` 以外)
+/// 2. 標準ひな形 (`勤務条件表_ひな形.xlsx`)
+/// 3. その他の `勤務条件*.xlsx`
 pub fn find_local_condition_excel() -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
     if let Ok(entries) = std::fs::read_dir(".") {
         for entry in entries.flatten() {
             let path = entry.path();
@@ -539,12 +546,31 @@ pub fn find_local_condition_excel() -> Option<PathBuf> {
                     && name.ends_with(".xlsx")
                     && !name.starts_with("~$")
                 {
-                    return Some(path);
+                    candidates.push(path);
                 }
             }
         }
     }
-    None
+    candidates.sort();
+
+    // 1. ユーザー独自の勤務条件表があれば最優先
+    if let Some(custom) = candidates.iter().find(|p| {
+        let n = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        n != "勤務条件表_ひな形.xlsx" && n != "勤務条件表_9.xlsx" && n != "勤務条件表_9月.xlsx"
+    }) {
+        return Some(custom.clone());
+    }
+
+    // 2. 標準条件表 (勤務条件表_ひな形.xlsx)
+    if let Some(tpl) = candidates
+        .iter()
+        .find(|p| p.file_name().and_then(|s| s.to_str()) == Some("勤務条件表_ひな形.xlsx"))
+    {
+        return Some(tpl.clone());
+    }
+
+    // 3. フォールバック
+    candidates.into_iter().next()
 }
 
 /// OS の既定アプリケーションでファイルを開く

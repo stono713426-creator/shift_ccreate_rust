@@ -1,8 +1,8 @@
 # 勤務シフト自動生成システム (Rust Edition)
 
-> Version: v1.2.0  
-> Release Date: 2026-11-01  
-> Status: v1.2.0 Released & Verified 🎉
+> Version: v1.2.1  
+> Release Date: 2026-11-05  
+> Status: v1.2.1 Released & Verified 🎉
 
 医療機関等の複雑な勤務シフト制約を、オープンソース最高峰の数理最適化ソルバー（MILP: HiGHS）によって高速解決し、現場フォーマットの Excel 帳票として出力する **純Rust製ネイティブ・デスクトップアプリケーション** です（Python版 `sift_create` v1.9.1 の全仕様完全移植プロジェクト）。
 
@@ -55,10 +55,11 @@
 ## 使い方
 
 ### 1. デスクトップ GUI で使う場合 (推奨)
-`shift_create_rust.exe` を引数なしでダブルクリックして起動します。
+`shift_create_rust.exe` を引数なしでダブルクリックして起動します。  
+配布パッケージには標準入力テンプレート **`勤務条件表_ひな形.xlsx`**（有効項目・補助項目・メモ項目の色分け、プルダウン入力規則、セルコメント、記入ガイドシート付き）が同梱されています。
 
 ```text
-1. 「📁 選択...」または「🔍 自動検出」をクリックして勤務条件表 Excel を読み込みます。
+1. 「📁 選択...」または「🔍 自動検出」をクリックして勤務条件表 Excel（同梱の 勤務条件表_ひな形.xlsx またはそのコピー）を読み込みます。
 2. スタッフ数や制約条件のプレビュー、作成対象月を確認します。
 3. 「🚀 シフト自動生成を開始」をクリックします。
 4. 数秒で全月のシフト表が完成します。「📊 出力 Excel を開く」で Excel を開いて確認・印刷できます。
@@ -66,11 +67,11 @@
 
 ### 2. コマンドライン (CLI) で使う場合
 ```powershell
-# 基本実行 (デフォルト命名規則で出力)
-shift_create_rust.exe 勤務条件表_9.xlsx
+# 基本実行 (標準ひな形からデフォルト命名規則で出力)
+shift_create_rust.exe 勤務条件表_ひな形.xlsx
 
 # 出力先パスを指定して実行
-shift_create_rust.exe 勤務条件表_9.xlsx 2026年秋シフト.xlsx
+shift_create_rust.exe 勤務条件表_ひな形.xlsx 2026年秋シフト.xlsx
 
 # ヘルプ表示
 shift_create_rust.exe --help
@@ -80,11 +81,16 @@ shift_create_rust.exe --help
 
 ## ビルドとテスト
 
+開発・回帰テストの標準条件表としてプロジェクト直下の **`勤務条件表_ひな形.xlsx`** を使用します。
+
 ```powershell
-# 全 19 件のテスト実行 (ユニット 10 件 + 統合回帰 9 件)
+# 標準ひな形 Excel (勤務条件表_ひな形.xlsx) の再生成
+cargo run --example generate_template
+
+# 全 22 件のテスト実行 (ユニット 10 件 + 統合回帰 12 件)
 cargo test
 
-# 配布用リリースビルド (ファイルバージョン v1.0.0 埋め込み)
+# 配布用リリースビルド (ファイルバージョン v1.2.1 埋め込み)
 cargo build --release
 ```
 
@@ -94,8 +100,9 @@ cargo build --release
 
 ビルド済みの配布用パッケージは `dist/` ディレクトリに生成されます：
 
-- **ZIP アーカイブ**: `dist/shift_create_rust_v1.0.0_windows_x64.zip` (約 8.4 MB)
+- **ZIP アーカイブ**: `dist/shift_create_rust_v1.2.1_windows_x64.zip`
 - **内容物**:
-  - `shift_create_rust.exe` (ネイティブ実行ファイル本体、バージョンリソース埋め込み済み)
+  - `shift_create_rust.exe` (ネイティブ実行ファイル本体、バージョンリソース `v1.2.1` 埋め込み済み)
+  - `勤務条件表_ひな形.xlsx` (標準勤務条件表ひな形：参照区分カラー・入力規則・記入ガイド付き)
   - `libstdc++-6.dll`, `libgcc_s_seh-1.dll`, `libwinpthread-1.dll` (ランタイム同梱)
   - `README.txt` (配布用マニュアル)
