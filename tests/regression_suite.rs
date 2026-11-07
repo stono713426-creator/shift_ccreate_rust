@@ -1,7 +1,8 @@
 //! 勤務シフト自動生成システム 統合回帰テストスイート (`tests/regression_suite.rs`)
 //!
-//! Version: v1.2.1
-//! Updated: 2026-11-05 - v1.2.1 標準開発条件表として「勤務条件表_ひな形.xlsx」を採用
+//! Version: v1.3.0
+//! Updated: 2026-11-08 - v1.3.0 test_13 2階裏職種判定・Ope日/注射日・石橋さん週4固定＆条件付水曜公休＆Ope外来除外・曜日別職種人数・土曜PM有休例外・早上がり重複補填・7ヶ月連続Stage1検証追加
+//! - v1.2.1 (2026-11-05): 標準開発条件表として「勤務条件表_ひな形.xlsx」を採用
 //! - v1.2.0 (2026-11-01): test_12 石橋特別枠・2階裏基本人数・3ヶ月ローテーション・OPEタイポ吸収・年跨ぎ年補完・前月実績年月ガード検証
 //! - v1.1.0 (2026-10-31): test_11 制約条件パース・除外スタッフ補正・主公休スライド・金曜HIGH1の3名体制検証
 //! - v1.0.1 (2026-10-31): test_10 小島さん11月特別有休パース・反映・Excel出力検証追加
@@ -759,46 +760,42 @@ fn test_12_full_spec_audit_v1_2_0() {
         "タイポ 'cay' が「cat」手術日として漏れなく検出されること"
     );
 
-    // 3. 石橋さん（週4日（必要に応じて週5日可）＋土曜固定公休）の特別枠動作確認
-    let ishibashi = parsed
+    // 3. 堀さん（週4日（必要に応じて週5日可））の特別枠および石橋さん（週4日固定＋土曜基本公休）の動作確認
+    let hori = parsed
         .staffs
         .iter()
-        .find(|s| s.name == "石橋")
-        .expect("石橋さんが存在すること");
+        .find(|s| s.name == "堀")
+        .expect("堀さんが存在すること");
     assert!(
-        ishibashi.is_special,
-        "石橋さんが特別枠 (is_special=true) として認識されていること"
+        hori.is_special,
+        "堀さんが特別枠 (is_special=true) として認識されていること"
     );
 
-    let mut special_test_parsed = parsed.clone();
-    // 2階裏の他スタッフに有休を追加し、石橋さんが target を超えて応援出勤できるか検証
-    if let Some(st) = special_test_parsed
-        .staffs
-        .iter_mut()
-        .find(|s| s.name == "大久保")
-    {
-        for d in [2u32, 9, 16, 30] {
-            st.vacation_dates
-                .insert(NaiveDate::from_ymd_opt(2026, 9, d).unwrap());
-        }
-    }
-    let res_sp = solve_shift(&special_test_parsed, 2026, 9, &holidays);
+    let res_sp = solve_shift(&parsed, 2026, 9, &holidays);
     assert!(res_sp.success && res_sp.stage == 1, "Stage 1 で解けること");
+    let hori_target = res_sp.target_days["堀"];
+    let hori_actual: i32 = res_sp.shifts["堀"].values().map(|&v| v as i32).sum();
+    assert!(
+        hori_actual >= hori_target && hori_actual <= hori_target + 5,
+        "堀さんの出勤日数 ({}) が [target={}, target+5={}] の範囲内であること",
+        hori_actual,
+        hori_target,
+        hori_target + 5
+    );
     let ishi_target = res_sp.target_days["石橋"];
     let ishi_actual: i32 = res_sp.shifts["石橋"].values().map(|&v| v as i32).sum();
-    assert!(
-        ishi_actual >= ishi_target && ishi_actual <= ishi_target + 5,
-        "石橋さんの出勤日数 ({}) が [target={}, target+5={}] の範囲内であること",
-        ishi_actual,
-        ishi_target,
-        ishi_target + 5
+    assert_eq!(
+        ishi_actual, ishi_target,
+        "石橋さんの出勤日数 ({}) が週4固定の所定勤務日数 ({}) と完全一致すること",
+        ishi_actual, ishi_target
     );
     let ctx_sep = MonthContext::new(2026, 9, &holidays);
     for &d in &ctx_sep.clinic_days {
-        if ctx_sep.weekday_map[&d] == 5 {
+        let dt = ctx_sep.date_map[&d];
+        if ctx_sep.weekday_map[&d] == 5 && !parsed.ope_dict.contains_key(&dt) {
             assert_eq!(
                 res_sp.shifts["石橋"][&d], 0,
-                "石橋さんの固定公休（土曜: 9/{}）は引き続き厳守されること",
+                "石橋さんのOpe・注射なし土曜（9/{}）は公休が厳守されること",
                 d
             );
         }
@@ -906,6 +903,334 @@ fn test_12_full_spec_audit_v1_2_0() {
         "除外フラグ=True のスタッフ（高橋・森川）が除外されていること"
     );
     assert_eq!(parsed.rules.len(), 12, "標準ひな形のシフト制約条件が12件であること");
+}
+
+// ============================================================================
+// 13. test_13_v1_3_0_2f_back_and_ishibashi_rules:
+//     v1.3.0 2階裏人数・職種バランスおよび石橋さん・長谷川さん勤務ルールの網羅検証
+// ============================================================================
+#[test]
+fn test_13_v1_3_0_2f_back_and_ishibashi_rules() {
+    use shift_core::parser::{is_injection_date, is_ope_date, parse_pm_dates_for_months};
+
+    let (parsed, holidays) = load_test_excel();
+
+    // ------------------------------------------------------------------------
+    // 1-1. 職種（看護師 / 検査）の判定検証
+    // ------------------------------------------------------------------------
+    for name in ["堀", "江原", "石橋"] {
+        let st = parsed.staffs.iter().find(|s| s.name == name).unwrap();
+        assert!(st.is_nurse() && !st.is_exam(), "{} さんは看護師として判定されること", name);
+    }
+    for name in ["長谷川", "小島"] {
+        let st = parsed.staffs.iter().find(|s| s.name == name).unwrap();
+        assert!(st.is_exam() && !st.is_nurse(), "{} さんは検査スタッフとして判定されること", name);
+    }
+
+    // 「勤務形態」列での看護師(Ns)・検査(スタッフ)表記も認識されること
+    let mut custom_parsed = parsed.clone();
+    // ------------------------------------------------------------------------
+    // 1-2. 手術日（Ope日）と「注射日」の判定検証
+    //   2026年9月に「水曜の注射日 (9/9)」「土曜の注射日 (9/19)」「水曜のOpe日 (9/16 下垂)」を設定して検証
+    // ------------------------------------------------------------------------
+    custom_parsed
+        .ope_dict
+        .insert(NaiveDate::from_ymd_opt(2026, 9, 9).unwrap(), "注射".to_string());
+    custom_parsed
+        .ope_dict
+        .insert(NaiveDate::from_ymd_opt(2026, 9, 19).unwrap(), "注射".to_string());
+    // 9/2(水) の Ope を外し「Ope・注射なし水曜」の週を作る（代わりに 9/1(火) に Vit,cat、9/3(木) に cat を設定）
+    custom_parsed
+        .ope_dict
+        .remove(&NaiveDate::from_ymd_opt(2026, 9, 2).unwrap());
+    custom_parsed
+        .ope_dict
+        .insert(NaiveDate::from_ymd_opt(2026, 9, 1).unwrap(), "Vit,cat".to_string());
+    custom_parsed
+        .ope_dict
+        .insert(NaiveDate::from_ymd_opt(2026, 9, 3).unwrap(), "cat".to_string());
+    custom_parsed
+        .ope_dict
+        .insert(NaiveDate::from_ymd_opt(2026, 9, 10).unwrap(), "Vit,cat".to_string());
+
+    let d_sep1 = NaiveDate::from_ymd_opt(2026, 9, 1).unwrap();
+    let d_sep9 = NaiveDate::from_ymd_opt(2026, 9, 9).unwrap();
+    let d_sep19 = NaiveDate::from_ymd_opt(2026, 9, 19).unwrap();
+    assert!(is_ope_date(&custom_parsed.ope_dict, &d_sep1));
+    assert!(!is_injection_date(&custom_parsed.ope_dict, &d_sep1));
+    assert!(!is_ope_date(&custom_parsed.ope_dict, &d_sep9), "注射のみの日は Ope日 ではないこと");
+    assert!(is_injection_date(&custom_parsed.ope_dict, &d_sep9), "9/9 は注射日であること");
+    assert!(is_injection_date(&custom_parsed.ope_dict, &d_sep19), "9/19(土) は注射日であること");
+
+    let res_custom = solve_shift(&custom_parsed, 2026, 9, &holidays);
+    assert!(
+        res_custom.success && res_custom.stage == 1,
+        "注射日・Ope日混在の9月カスタムケースが Stage 1 で解けること: {:?}",
+        res_custom.logs
+    );
+
+    // ------------------------------------------------------------------------
+    // 2-1. 石橋さんの個別勤務ルール検証
+    // ------------------------------------------------------------------------
+    let ishi_shifts = &res_custom.shifts["石橋"];
+    let ctx_sep = MonthContext::new(2026, 9, &holidays);
+
+    // (a) すべての Ope日 および 注射日（9/9水・9/16水・9/19土 含む）で必ず出勤 (1) していること
+    for &d in &ctx_sep.clinic_days {
+        let dt = ctx_sep.date_map[&d];
+        if is_ope_date(&custom_parsed.ope_dict, &dt) || is_injection_date(&custom_parsed.ope_dict, &dt) {
+            assert_eq!(
+                ishi_shifts[&d], 1,
+                "石橋さんは Ope日/注射日 (9/{}) に曜日を問わず必ず出勤していること",
+                d
+            );
+        }
+    }
+
+    // (b) 水曜に Ope・注射がない 9/2(水) は公休 (0) であること
+    assert_eq!(
+        ishi_shifts[&2], 0,
+        "Ope・注射がない水曜日 (9/2) は石橋さんが公休 (0) であること"
+    );
+
+    // (c) 水曜(9/9 注射) や 土曜(9/19 注射)・水曜(9/16 下垂) に出勤した週も、他の曜日を公休に振り替えて「週4日出勤」を厳守していること
+    for week in &ctx_sep.weeks {
+        // 9/7〜9/12 (week 1) と 9/14〜9/19 (week 2) は当月完結週
+        if week.days.len() == 7 {
+            let w_sum: u32 = week.clinic_days.iter().map(|&d| ishi_shifts[&d] as u32).sum();
+            if !week.has_holiday {
+                assert_eq!(
+                    w_sum, 4,
+                    "石橋さんは当月完結週 (week {}, days={:?}) において厳密に週4日出勤であること",
+                    week.week_index, week.days
+                );
+            }
+        }
+    }
+
+    // (d) 祝日がある5診療日週（例: 2026年11月 第2週 11/2〜11/7 [11/3文化の日]、第5週 11/23〜11/28 [11/23勤労感謝の日]）でも週4日出勤を維持すること
+    let res_nov = solve_shift(&parsed, 2026, 11, &holidays);
+    assert!(res_nov.success && res_nov.stage == 1, "2026年11月が Stage 1 で解けること");
+    let ctx_nov = MonthContext::new(2026, 11, &holidays);
+    for week in &ctx_nov.weeks {
+        if week.has_holiday && week.clinic_days.len() == 5 {
+            let w_sum: u32 = week
+                .clinic_days
+                .iter()
+                .map(|&d| res_nov.shifts["石橋"][&d] as u32)
+                .sum();
+            assert_eq!(
+                w_sum, 4,
+                "祝日を含む5診療日週 (11月 week {}) でも石橋さんは公休を減らして週4日出勤を維持すること",
+                week.week_index
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // 2-2 & 3-1 & 3-2 & 3-3. 2階裏（外来）の配置・職種バランス・Excel数式除外の検証
+    // ------------------------------------------------------------------------
+    let core_2f_b: Vec<&shift_core::parser::Staff> = custom_parsed
+        .staffs
+        .iter()
+        .filter(|s| s.section == "2階裏" && s.is_core && s.pattern != "除外")
+        .collect();
+
+    for &d in &ctx_sep.clinic_days {
+        let dt = ctx_sep.date_map[&d];
+        let w = ctx_sep.weekday_map[&d];
+        let is_ope = is_ope_date(&custom_parsed.ope_dict, &dt);
+
+        // 2-2: Ope日の外来メンバーは石橋さんを除外
+        let out_members: Vec<&&shift_core::parser::Staff> = core_2f_b
+            .iter()
+            .filter(|s| !(is_ope && s.name == "石橋"))
+            .collect();
+
+        let out_total: u32 = out_members
+            .iter()
+            .map(|s| res_custom.shifts[&s.name][&d] as u32)
+            .sum();
+        let out_nurse: u32 = out_members
+            .iter()
+            .filter(|s| s.is_nurse())
+            .map(|s| res_custom.shifts[&s.name][&d] as u32)
+            .sum();
+        let out_exam: u32 = out_members
+            .iter()
+            .filter(|s| s.is_exam())
+            .map(|s| res_custom.shifts[&s.name][&d] as u32)
+            .sum();
+
+        // 3-1: Ope日は石橋さんを除き最低3人以上（2人勤務不可）、看護師1以上、検査は物理上限(火曜以外は2)以上
+        if is_ope {
+            assert!(
+                out_total >= 3,
+                "9/{} (Ope日) の2階裏外来人数（石橋除外）が3人以上であること (実: {}人)",
+                d,
+                out_total
+            );
+            assert!(out_nurse >= 1, "9/{} (Ope日) の2階裏外来看護師が1人以上であること", d);
+            if w != 1 {
+                // 火曜は長谷川さんが固定公休のため検査上限1名、火曜以外のOpe日は検査2名以上必須
+                assert!(
+                    out_exam >= 2,
+                    "9/{} (火曜以外のOpe日) の2階裏外来検査スタッフが2人以上であること (実: {}人)",
+                    d,
+                    out_exam
+                );
+                // 3-1 ソフト目標: 木曜・金曜等のOpe日で 看護師2＋検査2＝4名 が達成されていること
+                assert_eq!(
+                    (out_nurse, out_exam),
+                    (2, 2),
+                    "9/{} (Ope日) で推奨目標の看護師2＋検査2（石橋さん除く）が達成されていること",
+                    d
+                );
+            }
+        }
+
+        // 3-2: 曜日別ハード制約
+        if w == 1 {
+            // 火曜日: 看護師2人以上、検査1人以上
+            assert!(
+                out_nurse >= 2 && out_exam >= 1,
+                "9/{} (火曜) の2階裏外来で 看護師>=2, 検査>=1 が厳守されること (Ns={}, Exam={})",
+                d,
+                out_nurse,
+                out_exam
+            );
+        } else if w == 3 {
+            // 木曜日: 看護師1人以上、検査2人以上
+            assert!(
+                out_nurse >= 1 && out_exam >= 2,
+                "9/{} (木曜) の2階裏外来で 看護師>=1, 検査>=2 が厳守されること (Ns={}, Exam={})",
+                d,
+                out_nurse,
+                out_exam
+            );
+        } else if w == 5 {
+            // 土曜日: 最低3人以上（PM有休なし）
+            assert!(
+                out_total >= 3,
+                "9/{} (土曜) の2階裏外来で最低3人以上が厳守されること (実: {}人)",
+                d,
+                out_total
+            );
+        }
+
+        // 3-3(2): 非Ope日に長谷川さんと石橋さんが同時出勤している場合、フルタイムが2人以上（外来計4人以上）配置されていること
+        if !is_ope && res_custom.shifts["長谷川"][&d] == 1 && res_custom.shifts["石橋"][&d] == 1 {
+            let ft_cnt: u32 = out_members
+                .iter()
+                .filter(|s| s.name != "長谷川" && s.name != "石橋")
+                .map(|s| res_custom.shifts[&s.name][&d] as u32)
+                .sum();
+            assert!(
+                ft_cnt >= 2 && out_total >= 4,
+                "9/{} (非Ope日) に長谷川・石橋が重複出勤した際、フルタイム2名以上（外来計4名以上）が増員配置されていること (ft={}, total={})",
+                d,
+                ft_cnt,
+                out_total
+            );
+        }
+    }
+
+    // Excel 出力で Ope日の「2階裏 人数」列数式から石橋さん列が減算され、注射日(9/9)は減算されないことの検証
+    let out_custom_xlsx = PathBuf::from("target/test_v1_3_0_custom_sep.xlsx");
+    let _ = fs::remove_file(&out_custom_xlsx);
+    render_shifts_to_file(
+        &out_custom_xlsx,
+        &custom_parsed,
+        &[(2026, 9, res_custom.clone())],
+        &holidays,
+    )
+    .expect("Excel出力成功");
+
+    let mut wb = open_workbook_auto(&out_custom_xlsx).expect("出力Excel再読込成功");
+    let sheet_range = wb.worksheet_range("2026年09月シフト").unwrap();
+    let header_row = sheet_range.rows().nth(1).unwrap();
+    // 2階裏の「人数」列を特定（石橋さんの直後の列）
+    let ishi_col_idx = header_row
+        .iter()
+        .position(|c| c.to_string().trim() == "石橋")
+        .expect("石橋列が存在すること");
+    let sec2_cnt_col = ishi_col_idx + 1;
+    assert_eq!(header_row[sec2_cnt_col].to_string().trim(), "人数");
+
+    let formula_range = wb
+        .worksheet_formula("2026年09月シフト")
+        .expect("数式レンジ取得成功");
+    // 9/1 (Ope日: row_idx = 2) の数式には "-COUNTIF(" が含まれること
+    let f_sep1 = formula_range
+        .get_value((2, sec2_cnt_col as u32))
+        .expect("9/1の2階裏人数数式が存在すること");
+    assert!(
+        f_sep1.contains("-COUNTIF("),
+        "Ope日(9/1)の2階裏人数数式で石橋さん列が減算されていること: {}",
+        f_sep1
+    );
+    // 9/9 (注射のみの日: row_idx = 10) の数式には "-COUNTIF(" が含まれないこと
+    let f_sep9 = formula_range
+        .get_value((10, sec2_cnt_col as u32))
+        .expect("9/9の2階裏人数数式が存在すること");
+    assert!(
+        !f_sep9.contains("-COUNTIF("),
+        "注射のみの日(9/9)の2階裏人数数式は石橋さんを含む通常のCOUNTIFであること: {}",
+        f_sep9
+    );
+    let _ = fs::remove_file(&out_custom_xlsx);
+
+    // ------------------------------------------------------------------------
+    // 3-2 例外条件: 土曜日の午後（PM）有休設定時に実質2人勤務が許容されることの検証
+    // ------------------------------------------------------------------------
+    let mut sat_pm_parsed = parsed.clone();
+    let cell_pm = calamine::Data::String("2026/09/12(PM)".to_string());
+    let pm_dates = parse_pm_dates_for_months(&cell_pm, 2026, &[(2026, 9)], Some(&holidays));
+    let sat_sep12 = NaiveDate::from_ymd_opt(2026, 9, 12).unwrap();
+    assert!(pm_dates.contains(&sat_sep12));
+
+    // 9/12(土) に江原さんが PM有休、小島さんが指定公休を取得して残り2名（長谷川・堀）のみ出勤可能なケースでも Stage 1 で成立すること
+    for st in &mut sat_pm_parsed.staffs {
+        if st.name == "江原" {
+            st.vacation_dates.insert(sat_sep12);
+            st.pm_leave_dates.insert(sat_sep12);
+        } else if st.name == "小島" {
+            st.specified_off_dates.insert(sat_sep12);
+        }
+    }
+    let res_sat_pm = solve_shift(&sat_pm_parsed, 2026, 9, &holidays);
+    assert!(
+        res_sat_pm.success && res_sat_pm.stage == 1,
+        "土曜PM有休による実質2人勤務例外が Stage 1 で成立すること"
+    );
+    let sat12_cnt: u32 = ["長谷川", "小島", "堀", "江原", "石橋"]
+        .iter()
+        .map(|&n| res_sat_pm.shifts[n][&12] as u32)
+        .sum();
+    assert_eq!(sat12_cnt, 2, "9/12(土) の終日出勤人数が2名として許容されること");
+
+    // ------------------------------------------------------------------------
+    // 全7ヶ月連続生成（2026年9月〜2027年3月）がすべて Stage 1 (Optimal) で解けることの検証
+    // ------------------------------------------------------------------------
+    let out_7m = PathBuf::from("target/test_v1_3_0_all_7months.xlsx");
+    let _ = fs::remove_file(&out_7m);
+    let opts_7m = GenerateOptions {
+        target_months: None, // ひな形の全対象月 (2026/09〜2027/03)
+        output_path: Some(out_7m.clone()),
+    };
+    let (_, results_7m) = ShiftGenerator::generate(&parsed, &holidays, &opts_7m, |_, _, _, _, _| {})
+        .expect("全7ヶ月連続生成に成功すること");
+    assert_eq!(results_7m.len(), 7);
+    for (y, m, r) in &results_7m {
+        assert!(
+            r.success && r.stage == 1,
+            "{}年{:02}月 が Stage 1 (厳格探索) で最適解を得られること (stage={})",
+            y,
+            m,
+            r.stage
+        );
+    }
+    let _ = fs::remove_file(&out_7m);
 }
 
 

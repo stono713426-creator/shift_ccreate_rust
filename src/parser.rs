@@ -1,7 +1,8 @@
 //! 勤務シフト自動生成システム Excelデータ解析・日付パーサー (`parser.rs`)
 //!
-//! Version: v1.2.0
-//! Updated: 2026-11-01 - v1.2.0 パーサー全面堅牢化: 年跨ぎM/D自動年補完、同日複数OPE統合、前月実績年月認識、3ヶ月履歴初期化、パート希望出勤曜日補完、OR表記拡張
+//! Version: v1.3.0
+//! Updated: 2026-11-08 - v1.3.0 「勤務形態」列・既存「職種」列からの職種(看護師/検査)判定、手術スケジュール「注射日」vs「Ope日」分離判定、PM有休(午後/半休)日付抽出対応
+//! - v1.2.0 (2026-11-01): パーサー全面堅牢化: 年跨ぎM/D自動年補完、同日複数OPE統合、前月実績年月認識、3ヶ月履歴初期化、パート希望出勤曜日補完、OR表記拡張
 //! - v1.1.0 (2026-10-31): シフト制約条件シートの列ヘッダー検出修正および除外フラグ大文字小文字対応
 //! - v1.0.1 (2026-10-31): 範囲日付パーサー改修(スペースなしハイフン範囲・年跨ぎ範囲対応)
 //!
@@ -40,9 +41,67 @@ pub struct Staff {
     pub special_vacation_dates: HashSet<NaiveDate>,
     pub preferred_off_dates: HashSet<NaiveDate>,
     pub specified_off_dates: HashSet<NaiveDate>,
+    /// 午後（PM）有休・半休等があらかじめ設定されている日付集合（土曜2人勤務許容判定用）
+    #[serde(default)]
+    pub pm_leave_dates: HashSet<NaiveDate>,
     pub is_core: bool,
     pub is_part_1f: bool,
     pub order: usize,
+}
+
+impl Staff {
+    /// 職種が「看護師（看護師 / Ns）」であるか判定
+    pub fn is_nurse(&self) -> bool {
+        let norm: String = self.role.nfkc().collect();
+        let lower = norm.to_lowercase();
+        norm.contains("看護師") || lower.contains("ns")
+    }
+
+    /// 職種が「検査（検査 / スタッフ 等、看護師以外）」であるか判定
+    pub fn is_exam(&self) -> bool {
+        if self.is_nurse() {
+            return false;
+        }
+        let norm: String = self.role.nfkc().collect();
+        let lower = norm.trim().to_lowercase();
+        lower.is_empty()
+            || norm.contains("検査")
+            || norm.contains("スタッフ")
+            || lower.contains("ort")
+    }
+}
+
+/// 手術種別テキストを個別種別トークンへ分割する
+pub fn split_ope_tokens(ope_str: &str) -> Vec<String> {
+    let norm: String = ope_str.nfkc().collect();
+    norm.split([',', '、', ';', '/', '／', '・', ' ', '\t', '\n', '\r'])
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// 手術種別文字列に「注射」以外のオペ（Vit, cat, gla, 下垂 等）が含まれる「Ope日」か判定
+pub fn is_ope_text(ope_str: &str) -> bool {
+    split_ope_tokens(ope_str)
+        .iter()
+        .any(|tok| !tok.contains("注射"))
+}
+
+/// 手術種別文字列に「注射」が含まれる「注射日」か判定
+pub fn is_injection_text(ope_str: &str) -> bool {
+    split_ope_tokens(ope_str)
+        .iter()
+        .any(|tok| tok.contains("注射"))
+}
+
+/// 指定日が「Ope日」（`注射` 以外のオペがある日）か判定
+pub fn is_ope_date(ope_dict: &HashMap<NaiveDate, String>, date: &NaiveDate) -> bool {
+    ope_dict.get(date).is_some_and(|s| is_ope_text(s))
+}
+
+/// 指定日が「注射日」（`注射` がある日）か判定
+pub fn is_injection_date(ope_dict: &HashMap<NaiveDate, String>, date: &NaiveDate) -> bool {
+    ope_dict.get(date).is_some_and(|s| is_injection_text(s))
 }
 
 /// シフト制約条件
@@ -155,11 +214,14 @@ pub fn parse_date_list_for_months(
                 }
             }
 
-            // 5. 時刻表記除去 (\b\d{1,2}:\d{2}(:\d{2})?\b) および 曜日表記除去 (例: (月), （火）)
+            // 5. 時刻表記除去、曜日表記除去 (例: (月), （火）)、および半休/AM・PM付記除去 (例: 9/12(PM), 9/12午後)
             let re_time = Regex::new(r"\b\d{1,2}:\d{2}(:\d{2})?\b").unwrap();
             let cleaned_time = re_time.replace_all(trimmed, "");
             let re_weekday = Regex::new(r"[\(（][月火水木金土日][\)）]").unwrap();
-            let cleaned = re_weekday.replace_all(&cleaned_time, "");
+            let cleaned_wday = re_weekday.replace_all(&cleaned_time, "");
+            let re_ampm =
+                Regex::new(r"(?i)[\(（]?\s*(?:am|pm|午前|午後|半休|早退|後休|前休)(?:有休|休)?\s*[\)）]?").unwrap();
+            let cleaned = re_ampm.replace_all(&cleaned_wday, "");
 
             // 記号 [,、;・\n\r]+ でトークン分割
             let re_split = Regex::new(r"[,、;・\n\r]+").unwrap();
@@ -175,6 +237,45 @@ pub fn parse_date_list_for_months(
             }
         }
         _ => {}
+    }
+
+    filter_holidays_sundays(dates, holidays_jp_dict)
+}
+
+/// セル文字列から「午後（PM）有休・半休・早退」指定が付いた日付のみを抽出する
+pub fn parse_pm_dates_for_months(
+    cell: &Data,
+    default_year: i32,
+    target_months: &[(i32, u32)],
+    holidays_jp_dict: Option<&HashMap<NaiveDate, String>>,
+) -> HashSet<NaiveDate> {
+    let mut dates = HashSet::new();
+    let Data::String(raw_s) = cell else {
+        return dates;
+    };
+
+    let normalized: String = raw_s.nfkc().collect();
+    let trimmed = normalized.trim();
+    if trimmed.is_empty() {
+        return dates;
+    }
+
+    let re_split = Regex::new(r"[,、;・\n\r]+").unwrap();
+    let re_pm_marker = Regex::new(r"(?i)(?:pm|午後|半休|早退|後休)").unwrap();
+    let re_time = Regex::new(r"\b\d{1,2}:\d{2}(:\d{2})?\b").unwrap();
+    let re_weekday = Regex::new(r"[\(（][月火水木金土日][\)）]").unwrap();
+    let re_ampm =
+        Regex::new(r"(?i)[\(（]?\s*(?:am|pm|午前|午後|半休|早退|後休|前休)(?:有休|休)?\s*[\)）]?").unwrap();
+
+    for seg in re_split.split(trimmed) {
+        let seg_trim = seg.trim();
+        if seg_trim.is_empty() || !re_pm_marker.is_match(seg_trim) {
+            continue;
+        }
+        let c1 = re_time.replace_all(seg_trim, "");
+        let c2 = re_weekday.replace_all(&c1, "");
+        let cleaned = re_ampm.replace_all(&c2, "");
+        parse_date_token(cleaned.trim(), default_year, target_months, &mut dates);
     }
 
     filter_holidays_sundays(dates, holidays_jp_dict)
@@ -642,10 +743,11 @@ fn parse_staff_sheet(
         return Err("スタッフシートが空です。".to_string());
     }
 
-    // ヘッダー行探索 (氏名, 所属, 雇用形態, 基本公休, 有休, 特別有休, 希望休, 指定公休, 希望出勤曜日, 除外)
+    // ヘッダー行探索 (氏名, 所属, 職種/勤務形態, 雇用形態, 基本公休, 有休, 特別有休, 希望休, 指定公休, 希望出勤曜日, 除外)
     let mut col_name = None;
     let mut col_section = None;
     let mut col_role = None;
+    let mut col_work_form = None;
     let mut col_employment = None;
     let mut col_pattern = None;
     let mut col_basic_off = None;
@@ -666,6 +768,8 @@ fn parse_staff_sheet(
                 col_name = Some(c_idx);
             } else if s.contains("所属") || s.contains("セクション") || s.contains("フロア") || s.contains("部署") {
                 col_section = Some(c_idx);
+            } else if s.contains("勤務形態") {
+                col_work_form = Some(c_idx);
             } else if s.contains("役職") || s.contains("役割") || s.contains("資格") || s.contains("職種") {
                 col_role = Some(c_idx);
             } else if s.contains("雇用形態") || s.contains("形態") {
@@ -724,8 +828,40 @@ fn parse_staff_sheet(
         }
 
         let section = col_section.and_then(|c| row.get(c)).map(|d| d.to_string().trim().to_string()).unwrap_or_default();
-        let role = col_role.and_then(|c| row.get(c)).map(|d| d.to_string().trim().to_string()).unwrap_or_default();
-        let employment = col_employment.and_then(|c| row.get(c)).map(|d| d.to_string().trim().to_string()).unwrap_or_default();
+        let raw_role = col_role.and_then(|c| row.get(c)).map(|d| d.to_string().trim().to_string()).unwrap_or_default();
+        let raw_work_form = col_work_form.and_then(|c| row.get(c)).map(|d| d.to_string().trim().to_string()).unwrap_or_default();
+        let raw_employment = col_employment.and_then(|c| row.get(c)).map(|d| d.to_string().trim().to_string()).unwrap_or_default();
+
+        // 「勤務形態」列および「職種」列の両方から職種（看護師(Ns) / 検査(スタッフ)）を判定
+        let wf_norm: String = raw_work_form.nfkc().collect();
+        let wf_lower = wf_norm.to_lowercase();
+        let wf_has_role = wf_norm.contains("看護師")
+            || wf_lower.contains("ns")
+            || wf_norm.contains("検査")
+            || wf_norm.contains("スタッフ")
+            || wf_lower.contains("ort");
+
+        let role = if wf_has_role {
+            raw_work_form.clone()
+        } else if !raw_role.is_empty() {
+            raw_role
+        } else {
+            raw_work_form.clone()
+        };
+
+        // 雇用形態（「雇用形態」列が空で「勤務形態」列に正社員・パート区分が入っている場合も補完）
+        let employment = if !raw_employment.is_empty() {
+            raw_employment
+        } else if wf_norm.contains("パート社員") {
+            "パート社員".to_string()
+        } else if wf_norm.contains("正社員") {
+            "正社員".to_string()
+        } else if wf_norm.contains("パート") {
+            "パート".to_string()
+        } else {
+            String::new()
+        };
+
         let pattern = col_pattern.and_then(|c| row.get(c)).map(|d| d.to_string().trim().to_string()).unwrap_or_default();
 
         let basic_off_str = col_basic_off.and_then(|c| row.get(c)).map(|d| d.to_string().trim().to_string()).unwrap_or_default();
@@ -733,7 +869,9 @@ fn parse_staff_sheet(
         // 曜日抽出: 月火水木金土日 -> 0..=6
         let mut basic_off_days = extract_weekdays(&basic_off_str);
 
-        let is_core = employment == "正社員" || employment == "パート社員";
+        let is_core = employment == "正社員"
+            || employment == "パート社員"
+            || (employment.is_empty() && (pattern.contains("週5") || pattern.contains("週4")));
         let is_part_1f = section == "1階" && employment == "パート";
         let is_special = pattern.contains("必要に応じて週5") || pattern.contains("必要に応じて");
 
@@ -790,6 +928,19 @@ fn parse_staff_sheet(
             .map(|d| parse_date_list_for_months(d, default_year, target_months, Some(holidays)))
             .unwrap_or_default();
 
+        // 午後（PM）有休・半休・早退の指定日を収集（土曜日2人勤務許容判定用）
+        let mut pm_leave_dates = HashSet::new();
+        for col_opt in [col_vacation, col_special_vacation, col_preferred_off, col_specified_off] {
+            if let Some(cell) = col_opt.and_then(|c| row.get(c)) {
+                pm_leave_dates.extend(parse_pm_dates_for_months(
+                    cell,
+                    default_year,
+                    target_months,
+                    Some(holidays),
+                ));
+            }
+        }
+
         let mut staff = Staff {
             name,
             section,
@@ -804,6 +955,7 @@ fn parse_staff_sheet(
             special_vacation_dates,
             preferred_off_dates,
             specified_off_dates,
+            pm_leave_dates,
             is_core,
             is_part_1f,
             order: r_idx,
@@ -1221,5 +1373,68 @@ mod tests {
         assert!(!dates.contains(&NaiveDate::from_ymd_opt(2024, 9, 16).unwrap()));
         assert!(dates.contains(&NaiveDate::from_ymd_opt(2024, 9, 17).unwrap()));
         assert_eq!(dates.len(), 1);
+    }
+
+    #[test]
+    fn test_ope_vs_injection_detection() {
+        assert!(is_ope_text("Vit,cat"));
+        assert!(!is_injection_text("Vit,cat"));
+
+        assert!(!is_ope_text("注射"));
+        assert!(is_injection_text("注射"));
+
+        assert!(!is_ope_text("硝子体注射"));
+        assert!(is_injection_text("硝子体注射"));
+
+        assert!(is_ope_text("cat, 注射"));
+        assert!(is_injection_text("cat, 注射"));
+
+        assert!(!is_ope_text(""));
+        assert!(!is_injection_text(""));
+    }
+
+    #[test]
+    fn test_pm_leave_parsing_and_role_detection() {
+        let cell = Data::String("9/12(PM), 9/19午後, 9/26".to_string());
+        let all_dates = parse_date_list(&cell, 2026, None);
+        assert_eq!(all_dates.len(), 3);
+        assert!(all_dates.contains(&NaiveDate::from_ymd_opt(2026, 9, 12).unwrap()));
+        assert!(all_dates.contains(&NaiveDate::from_ymd_opt(2026, 9, 19).unwrap()));
+        assert!(all_dates.contains(&NaiveDate::from_ymd_opt(2026, 9, 26).unwrap()));
+
+        let pm_dates = parse_pm_dates_for_months(&cell, 2026, &[], None);
+        assert_eq!(pm_dates.len(), 2);
+        assert!(pm_dates.contains(&NaiveDate::from_ymd_opt(2026, 9, 12).unwrap()));
+        assert!(pm_dates.contains(&NaiveDate::from_ymd_opt(2026, 9, 19).unwrap()));
+        assert!(!pm_dates.contains(&NaiveDate::from_ymd_opt(2026, 9, 26).unwrap()));
+
+        let s_ns = Staff {
+            name: "テストA".to_string(),
+            section: "2階裏".to_string(),
+            role: "看護師(Ns)".to_string(),
+            employment: "正社員".to_string(),
+            pattern: "週4日".to_string(),
+            basic_off_days: vec![],
+            basic_off_type: OffType::Or,
+            is_auto_rotated_off: false,
+            is_special: false,
+            vacation_dates: HashSet::new(),
+            special_vacation_dates: HashSet::new(),
+            preferred_off_dates: HashSet::new(),
+            specified_off_dates: HashSet::new(),
+            pm_leave_dates: HashSet::new(),
+            is_core: true,
+            is_part_1f: false,
+            order: 1,
+        };
+        assert!(s_ns.is_nurse());
+        assert!(!s_ns.is_exam());
+
+        let s_exam = Staff {
+            role: "検査(スタッフ)".to_string(),
+            ..s_ns
+        };
+        assert!(!s_exam.is_nurse());
+        assert!(s_exam.is_exam());
     }
 }

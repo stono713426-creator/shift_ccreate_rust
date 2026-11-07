@@ -1,7 +1,8 @@
 //! 勤務シフト自動生成システム 複数月連続生成サービス (`generator.rs`)
 //!
-//! Version: v1.2.0
-//! Updated: 2026-11-01 - v1.2.0 前月シフト実績シートの年月整合ガード・過去最大3ヶ月主公休履歴の引き継ぎ実装
+//! Version: v1.3.0
+//! Updated: 2026-11-08 - v1.3.0 2階裏配置制約・石橋さん/長谷川さん個別ルール改修リリース同期
+//! - v1.2.0 (2026-11-01): 前月シフト実績シートの年月整合ガード・過去最大3ヶ月主公休履歴の引き継ぎ実装
 //! - v1.0.0 (2026-10-31): Phase 3 実装: 複数月連続生成・月跨ぎ実績引き継ぎ・Excel一括レンダリング
 //!
 //! - 入力Excelデータおよび対象月リスト（target_months）に基づく連続ソルブ
@@ -124,12 +125,14 @@ impl ShiftGenerator {
                 match expected_from_sheet {
                     Some(exp_ym) if exp_ym != (year, month) => {
                         // 例: 前月実績シートが「2026年12月」なのに「2026年9月」から生成する場合はクリア
+                        working_parsed.prev_sheet_year_month = None;
                         working_parsed.prev_month_tail_shifts.clear();
                         working_parsed.prev_month_main_offs.clear();
                         working_parsed.prev_month_main_offs_history.clear();
                     }
                     Some(exp_ym) if exp_ym == (year, month) => {
                         // 前月を解かずにシート記載年月の翌月（例: 2027年1月）を解く場合はシート実績を復元
+                        working_parsed.prev_sheet_year_month = parsed.prev_sheet_year_month;
                         working_parsed.prev_month_tail_shifts = sheet_tail.clone();
                         working_parsed.prev_month_main_offs = sheet_offs.clone();
                         working_parsed.prev_month_main_offs_history = sheet_hist.clone();
@@ -137,6 +140,7 @@ impl ShiftGenerator {
                     _ => {
                         if idx > 0 {
                             // シート年月不明かつ飛び月生成の場合は連勤引き継ぎのみクリア
+                            working_parsed.prev_sheet_year_month = None;
                             working_parsed.prev_month_tail_shifts.clear();
                         }
                     }
@@ -199,6 +203,7 @@ impl ShiftGenerator {
                         new_tail_shifts.insert(staff.name.clone(), tail);
                     }
                 }
+                working_parsed.prev_sheet_year_month = Some((year, month));
                 working_parsed.prev_month_tail_shifts = new_tail_shifts;
             } else {
                 progress_cb(

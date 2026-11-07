@@ -1,7 +1,8 @@
 //! Windows 実行ファイル (.exe) へのバージョン情報リソース自動埋め込みスクリプト
 //!
-//! Version: v1.2.1
-//! Updated: 2026-11-05 - v1.2.1 windres プリプロセッサに LLVM clang.exe フォールバックを追加（Windows Smart App Control 対応）
+//! Version: v1.3.0
+//! Updated: 2026-11-08 - v1.3.0 リリースバージョン同期
+//! - v1.2.1 (2026-11-05): windres プリプロセッサに LLVM clang.exe フォールバックを追加（Windows Smart App Control 対応）
 //! - v1.0.0 (2026-10-31): Cargo.toml の version から自動的に FileVersion / ProductVersion を埋め込む初期構築
 
 use std::env;

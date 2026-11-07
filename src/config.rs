@@ -1,7 +1,8 @@
 //! 勤務シフト自動生成システム 設定モジュール (`config.rs`)
 //!
-//! Version: v1.2.0
-//! Updated: 2026-11-01 - v1.2.0 全15設定項目・全固定ペナルティ重みの完全連動 (HIGH1推奨重み 10.2M 微調整で一般セクションブレ幅スラック 10M より上位を確定)
+//! Version: v1.3.0
+//! Updated: 2026-11-08 - v1.3.0 2階裏職種バランス・Ope推奨・石橋さん水曜公休・早上がり重複回避＆フルタイム増員ペナルティ定数追加
+//! - v1.2.0 (2026-11-01): 全15設定項目・全固定ペナルティ重みの完全連動 (HIGH1推奨重み 10.2M 微調整で一般セクションブレ幅スラック 10M より上位を確定)
 //! - v1.1.0 (2026-10-31): HIGH1推奨人数ペナルティ引き上げおよび主公休スライド許容スラック重み追加
 //! - v1.0.0 (2026-10-31): Phase 1 初期実装: 10段階制約重み、固定ペナルティ、ShiftConfig (全15項目)
 //!
@@ -100,14 +101,26 @@ pub fn get_rec_weight(level: &str) -> i64 {
 pub const WEIGHT_FIXED_OFF_SHORTAGE: i64 = 30_000_000;
 /// Stage 2: 2階裏 最低人数不足スラック
 pub const WEIGHT_2F_BACK_MIN_SLACK: i64 = 20_000_000;
+/// Stage 2: 2階裏 職種別（看護師・検査）および曜日・Ope日ハード制約の不足スラック
+pub const WEIGHT_2F_BACK_ROLE_MIN_SLACK: i64 = 18_000_000;
 /// Stage 2: 2階裏 看護師最低人数不足スラック
 pub const WEIGHT_NURSE_DEFICIT_SLACK: i64 = 15_000_000;
+/// Stage 2 / 非常時: 石橋さんの非Ope・非注射週における水曜公休緩和スラック
+pub const WEIGHT_ISHIBASHI_WED_OFF_SLACK: i64 = 14_000_000;
 /// Stage 2: 一般セクション最低不足・最大超過スラック
 pub const WEIGHT_GENERAL_SEC_SLACK: i64 = 10_000_000;
+/// 週4日×固定1日スタッフの第2公休曜日スライド抑制ペナルティ（5週ある月等の暦日数不整合時のみStage 1で最小限許容）
+pub const WEIGHT_SECOND_OFF_SLIDE_SLACK: i64 = 8_500_000;
 /// Stage 2: 祝日週の最低1日公休（最大出勤日数）超過スラック
 pub const WEIGHT_SUBSTITUTE_OFF_SLACK: i64 = 8_000_000;
+/// `AND` 固定公休スタッフの所定勤務日数 (`target_days`) 未達ペナルティ（早上がり重複補填 5.4M より上位、祝日振替休 8M より下位）
+pub const WEIGHT_FIXED_OFF_UNDER_TARGET: i64 = 7_000_000;
 /// Stage 2: 2階裏 通常週の4名体制日数不足スラック
 pub const WEIGHT_2F_BACK_WEEKLY_4_SLACK: i64 = 5_000_000;
+/// 非Ope日に早上がりスタッフ（長谷川・石橋）が重複した際のフルタイム増員（+1名）不足ペナルティ
+pub const WEIGHT_EARLY_OVERLAP_FULLTIME_SLACK: i64 = 5_000_000;
+/// Ope日の2階裏推奨体制（石橋さん以外に看護師2人＋検査2人＝計4人）不足ペナルティ
+pub const WEIGHT_OPE_2F_BACK_REC_PENALTY: i64 = 3_500_000;
 /// 2階裏 5名出勤ペナルティ
 pub const WEIGHT_2F_BACK_5_PENALTY: i64 = 2_000_000;
 /// OR型スタッフの週次主公休曜日スライド許容ペナルティ（HIGH1/HIGH2推奨人数達成時に主公休の一時移動を許容）
@@ -118,6 +131,8 @@ pub const WEIGHT_1F_UNDER_7_PENALTY: i64 = 1_500_000;
 pub const WEIGHT_SEC_BALANCE_SQ: i64 = 500_000;
 /// セクション人数平準化（平均 `round(M_s)` からの絶対誤差）
 pub const WEIGHT_SEC_BALANCE_ABS: i64 = 500_000;
+/// 非Ope日に早上がりスタッフ（長谷川・石橋）が同時出勤する重複回避ペナルティ（ソフト制約）
+pub const WEIGHT_EARLY_OVERLAP_PENALTY: i64 = 400_000;
 /// 主公休曜日以外の平日に「公」が入る不一致ペナルティ
 pub const WEIGHT_MAIN_OFF_MISMATCH: i64 = 300_000;
 /// 2階裏 3名出勤ペナルティ

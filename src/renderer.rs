@@ -1,7 +1,8 @@
 //! 勤務シフト自動生成システム 現場フォーマット Excel レンダラー (`renderer.rs`)
 //!
-//! Version: v1.2.0
-//! Updated: 2026-11-01 - v1.2.0 リリースバージョン同期
+//! Version: v1.3.0
+//! Updated: 2026-11-08 - v1.3.0 Ope日（注射以外の手術日）における石橋さんの「2階裏（外来）人数」列数式および警告カウントからの除外対応
+//! - v1.2.0 (2026-11-01): リリースバージョン同期
 //! - v1.0.0 (2026-10-31): Phase 3 実装: SPECIFICATION.md セクション6 完全準拠の現場フォーマット Excel 出力
 //!
 //! - シート名: "{year}年{month:02}月シフト"
@@ -18,11 +19,11 @@
 //! - セル値・書式:
 //!   - 日曜・祝日: 背景 #FCE4D6, 文字 #C00000, スタッフセル "休業"
 //!   - 通常診療日: 有休 "有休", 特有 "特有", 出勤 "○" (手術日は文字色 #006100, 通常 #000000), 公休 "公" (文字色 #595959)
-//!   - 警告列: 非休業日で 2階裏出勤数 <= warn_2f_back_count のとき "⚠️" (背景 #FCE4D6, 文字 #C00000)
-//!   - 人数式: =COUNTIF({開始列}{行}:{終了列}{行}, "○")
+//!   - 警告列: 非休業日で 2階裏（外来）出勤数 <= warn_2f_back_count のとき "⚠️" (背景 #FCE4D6, 文字 #C00000)
+//!   - 人数式: =COUNTIF({開始列}{行}:{終了列}{行}, "○")（※Ope日の2階裏は石橋さん列を減算）
 //!   - 下部集計4行: 合計出勤日数 (=COUNTIF), 所定勤務日数, 公休日数 (=COUNTIF), 主公休曜日
 
-use crate::parser::{OffType, ParsedExcelData, Staff};
+use crate::parser::{is_ope_date, OffType, ParsedExcelData, Staff};
 use crate::solver::{MonthContext, SolveResult};
 use chrono::NaiveDate;
 use rust_xlsxwriter::{
@@ -326,6 +327,7 @@ struct SheetLayout {
     sec1_count_col: Option<u16>,
     sec2_count_col: Option<u16>,
     sec3_count_col: Option<u16>,
+    sec2_ishibashi_col: Option<u16>,
 }
 
 impl SheetLayout {
@@ -344,6 +346,7 @@ impl SheetLayout {
         let mut sec1_count_col = None;
         let mut sec2_count_col = None;
         let mut sec3_count_col = None;
+        let mut sec2_ishibashi_col = None;
 
         let sections = [
             ("2階表", true),
@@ -362,6 +365,10 @@ impl SheetLayout {
             if !staffs.is_empty() {
                 let start_c = columns.len() as u16;
                 for s in staffs {
+                    let cur_c = columns.len() as u16;
+                    if sec_name == "2階裏" && s.name == "石橋" {
+                        sec2_ishibashi_col = Some(cur_c);
+                    }
                     columns.push(ColType::Staff(s));
                 }
                 let end_c = (columns.len() - 1) as u16;
@@ -400,6 +407,7 @@ impl SheetLayout {
             sec1_count_col,
             sec2_count_col,
             sec3_count_col,
+            sec2_ishibashi_col,
         }
     }
 }
@@ -516,14 +524,16 @@ fn render_month_sheet(
         } else if let Some(ope) = ctx.parsed.ope_dict.get(&date) {
             desc = ope.clone();
         }
-        let is_ope_day = ctx.parsed.ope_dict.contains_key(&date);
+        // 仕様 1-2 & 2-2: 「注射」以外のオペがある日を「Ope日」と判定
+        let is_ope_day = is_ope_date(&ctx.parsed.ope_dict, &date);
+        let has_any_ope_or_inj = ctx.parsed.ope_dict.contains_key(&date);
 
-        // 2階裏出勤数カウント（警告判定用）
+        // 2階裏（外来）出勤数カウント（警告判定用：Ope日は石橋さんを外来人数から除外）
         let mut count_2f_back = 0;
         if !is_closed {
             for col in &layout.columns {
                 if let ColType::Staff(ref s) = col {
-                    if s.section == "2階裏" {
+                    if s.section == "2階裏" && !(is_ope_day && s.name == "石橋") {
                         if let Some(shifts) = ctx.result.shifts.get(&s.name) {
                             if shifts.get(&d) == Some(&1) {
                                 count_2f_back += 1;
@@ -605,7 +615,7 @@ fn render_month_sheet(
                             == 1;
 
                         if is_work {
-                            let f = if is_ope_day {
+                            let f = if has_any_ope_or_inj {
                                 &fmt.data_work_ope
                             } else {
                                 &fmt.data_work_normal
@@ -638,8 +648,38 @@ fn render_month_sheet(
                     if let Some((start_c, end_c)) = range_opt {
                         let c1 = col_to_letter(start_c);
                         let c2 = col_to_letter(end_c);
-                        let formula = format!("=COUNTIF({}{}:{}{}, \"○\")", c1, excel_row, c2, excel_row);
-                        worksheet.write_formula_with_format(row_idx, c, formula.as_str(), f)?;
+                        if !is_closed && is_ope_day && sec_name == "2階裏" {
+                            if let Some(ishi_c) = layout.sec2_ishibashi_col {
+                                if start_c == end_c && start_c == ishi_c {
+                                    worksheet.write_number_with_format(row_idx, c, 0.0, f)?;
+                                } else {
+                                    let ishi_letter = col_to_letter(ishi_c);
+                                    let formula = format!(
+                                        "=COUNTIF({0}{2}:{1}{2}, \"○\")-COUNTIF({3}{2}, \"○\")",
+                                        c1, c2, excel_row, ishi_letter
+                                    );
+                                    worksheet.write_formula_with_format(
+                                        row_idx,
+                                        c,
+                                        formula.as_str(),
+                                        f,
+                                    )?;
+                                }
+                            } else {
+                                let formula =
+                                    format!("=COUNTIF({}{}:{}{}, \"○\")", c1, excel_row, c2, excel_row);
+                                worksheet.write_formula_with_format(
+                                    row_idx,
+                                    c,
+                                    formula.as_str(),
+                                    f,
+                                )?;
+                            }
+                        } else {
+                            let formula =
+                                format!("=COUNTIF({}{}:{}{}, \"○\")", c1, excel_row, c2, excel_row);
+                            worksheet.write_formula_with_format(row_idx, c, formula.as_str(), f)?;
+                        }
                     } else {
                         worksheet.write_number_with_format(row_idx, c, 0.0, f)?;
                     }
@@ -785,8 +825,8 @@ fn render_month_sheet(
 
 /// スタッフの主公休曜日表示文字列を計算する
 fn get_staff_main_off_display(staff: &Staff, result: &SolveResult) -> String {
-    let has_rotating_second_off = staff.is_core
-        && staff.pattern.contains("週4")
+    let has_rotating_second_off = (staff.is_core || staff.name == "石橋")
+        && (staff.pattern.contains("週4") || staff.name == "石橋")
         && staff.basic_off_days.len() == 1
         && staff.basic_off_type == OffType::And;
 
