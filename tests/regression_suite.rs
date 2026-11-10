@@ -1,7 +1,8 @@
 //! 勤務シフト自動生成システム 統合回帰テストスイート (`tests/regression_suite.rs`)
 //!
-//! Version: v1.3.0
-//! Updated: 2026-11-08 - v1.3.0 test_13 2階裏職種判定・Ope日/注射日・石橋さん週4固定＆条件付水曜公休＆Ope外来除外・曜日別職種人数・土曜PM有休例外・早上がり重複補填・7ヶ月連続Stage1検証追加
+//! Version: v1.3.1
+//! Updated: 2026-11-10 - v1.3.1 test_14 連勤上限・希望休超過・Ope集中週・HARDペア全休時のソルバー破綻＆重み逆転防止検証追加
+//! - v1.3.0 (2026-11-08): test_13 2階裏職種判定・Ope日/注射日・石橋さん週4固定＆条件付水曜公休＆Ope外来除外・曜日別職種人数・土曜PM有休例外・早上がり重複補填・7ヶ月連続Stage1検証追加
 //! - v1.2.1 (2026-11-05): 標準開発条件表として「勤務条件表_ひな形.xlsx」を採用
 //! - v1.2.0 (2026-11-01): test_12 石橋特別枠・2階裏基本人数・3ヶ月ローテーション・OPEタイポ吸収・年跨ぎ年補完・前月実績年月ガード検証
 //! - v1.1.0 (2026-10-31): test_11 制約条件パース・除外スタッフ補正・主公休スライド・金曜HIGH1の3名体制検証
@@ -1232,6 +1233,151 @@ fn test_13_v1_3_0_2f_back_and_ishibashi_rules() {
     }
     let _ = fs::remove_file(&out_7m);
 }
+
+// ============================================================================
+// 14. test_14_v1_3_1_conflict_and_crash_prevention:
+//     v1.3.1 Category 1 & Category 2 ソルバー破綻（INFEASIBLE）および重み逆転防止の検証
+// ============================================================================
+#[test]
+fn test_14_v1_3_1_conflict_and_crash_prevention() {
+    let (parsed, holidays) = load_test_excel();
+
+    // ------------------------------------------------------------------------
+    // ケース1 (Category 1):
+    //   - 石橋さんの前月末尾シフトが5連勤 [1,1,1,1,1] かつ 当月1日(9/1)が Ope日（必須出勤）
+    //   - 非コアスタッフ（加藤さん）の基本公休が空欄（週6稼働設定）で連勤上限(5日)と衝突する設定
+    // ------------------------------------------------------------------------
+    let mut case1 = parsed.clone();
+    case1
+        .prev_month_tail_shifts
+        .insert("石橋".to_string(), vec![0, 0, 1, 1, 1, 1, 1]);
+    case1
+        .ope_dict
+        .insert(NaiveDate::from_ymd_opt(2026, 9, 1).unwrap(), "Vit,cat".to_string());
+    if let Some(kato) = case1.staffs.iter_mut().find(|s| s.name == "加藤") {
+        kato.basic_off_days.clear();
+    }
+    let res1 = solve_shift(&case1, 2026, 9, &holidays);
+    assert!(
+        res1.success && res1.stage == 1,
+        "ケース1（前月5連勤＋1日Ope必須＋非コア週6設定）がクラッシュせず Stage 1 で解けること"
+    );
+    assert_eq!(res1.shifts["石橋"][&1], 1, "石橋さんが 9/1(Ope日) に出勤できていること");
+    // 加藤さんが月内で5連勤上限を守っていること
+    let mut kato_streak = 0;
+    for d in 1..=30 {
+        if res1.shifts["加藤"][&d] == 1 {
+            kato_streak += 1;
+            assert!(kato_streak <= 5, "非コアスタッフ（加藤）も5連勤上限を守っていること");
+        } else {
+            kato_streak = 0;
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // ケース2 (Category 1):
+    //   - 特別枠（堀さん: is_special）および通常コアスタッフ（小島さん）に大量の希望休（14日分）を設定し、
+    //     従来の所定日数(16日/20日)が物理的出勤可能日数を超過するケース
+    // ------------------------------------------------------------------------
+    let mut case2 = parsed.clone();
+    for st in &mut case2.staffs {
+        if st.name == "堀" || st.name == "小島" {
+            for d in 1..=18 {
+                if let Some(dt) = NaiveDate::from_ymd_opt(2026, 9, d) {
+                    st.preferred_off_dates.insert(dt);
+                }
+            }
+        }
+    }
+    let res2 = solve_shift(&case2, 2026, 9, &holidays);
+    assert!(
+        res2.success,
+        "ケース2（堀さん・小島さんに大量の希望休設定）でも INFEASIBLE クラッシュせず解けること"
+    );
+    assert!(
+        res2.target_days["堀"] <= 12 && res2.target_days["小島"] <= 12,
+        "希望休超過時に target_days が物理的最大出勤可能日数以下に自動クランプされること: 堀={}, 小島={}",
+        res2.target_days["堀"],
+        res2.target_days["小島"]
+    );
+
+    // ------------------------------------------------------------------------
+    // ケース3 (Category 1 & 2):
+    //   - 同一週（9/7月〜9/12土の6日間すべて）に Ope日が6日連続で設定された極端ケース
+    //     （石橋さんのOpe必須6日 vs 5連勤上限、および2階裏検査スタッフ2名必須×6日 vs 週5日上限）
+    // ------------------------------------------------------------------------
+    let mut case3 = parsed.clone();
+    for d in 7..=12 {
+        case3
+            .ope_dict
+            .insert(NaiveDate::from_ymd_opt(2026, 9, d).unwrap(), "Vit,cat".to_string());
+    }
+    let res3 = solve_shift(&case3, 2026, 9, &holidays);
+    assert!(
+        res3.success && res3.stage == 1,
+        "ケース3（週6日すべてOpe日の極端な週）でも供給量ガードにより Stage 1 で破綻せず解けること"
+    );
+    let ishi_w1_sum: u32 = (7..=12).map(|d| res3.shifts["石橋"][&d] as u32).sum();
+    assert!(
+        ishi_w1_sum <= 5,
+        "週6日Opeがあっても石橋さんの5連勤上限が守られること (w1_sum={})",
+        ishi_w1_sum
+    );
+
+    // ------------------------------------------------------------------------
+    // ケース4 (Category 2):
+    //   - df_rules の HARD ペア（田中島,梶原：全日最低1名）の片方（田中島さん）が1週間（9/7月〜9/12土）丸ごと有休を取得し、
+    //     もう片方（梶原さん）が6連勤を強制されそうになるケース
+    // ------------------------------------------------------------------------
+    let mut case4 = parsed.clone();
+    if let Some(st) = case4.staffs.iter_mut().find(|s| s.name == "田中島") {
+        for d in 7..=12 {
+            st.vacation_dates
+                .insert(NaiveDate::from_ymd_opt(2026, 9, d).unwrap());
+        }
+    }
+    let res4 = solve_shift(&case4, 2026, 9, &holidays);
+    assert!(
+        res4.success && res4.stage == 1,
+        "ケース4（HARDペアの片方が1週間全休）でも連勤上限と衝突せず Stage 1 で解けること"
+    );
+    let kaji_w1_sum: u32 = (7..=12).map(|d| res4.shifts["梶原"][&d] as u32).sum();
+    assert_eq!(
+        kaji_w1_sum, 5,
+        "相方が1週間全休のとき、梶原さんは連勤上限(5日)まで出勤して1日公休を確保すること"
+    );
+
+    // ------------------------------------------------------------------------
+    // ケース5 (Category 3):
+    //   - 標準ひな形で誤警告が出ないこと（除外スタッフの高橋・森川を含むルールでも警告0件）
+    //   - 和暦（令和8年9月15日, R8/9/18）の日付パースが正常に動作すること
+    //   - MonthContext::new に異常月（month=99）が渡されてもパニックせず安全にクランプされること
+    //   - 事前診断ログ（⚠️ [事前診断]）がケース1・ケース3の SolveResult.logs に記録されていること
+    // ------------------------------------------------------------------------
+    assert!(
+        parsed.parse_warnings.is_empty(),
+        "標準ひな形では parse_warnings が空であること: {:?}",
+        parsed.parse_warnings
+    );
+
+    let reiwa_cell = calamine::Data::String("令和8年9月15日, R8/9/18".to_string());
+    let reiwa_dates = shift_create_rust::parser::parse_date_list(&reiwa_cell, 2026, None);
+    assert!(reiwa_dates.contains(&NaiveDate::from_ymd_opt(2026, 9, 15).unwrap()));
+    assert!(reiwa_dates.contains(&NaiveDate::from_ymd_opt(2026, 9, 18).unwrap()));
+
+    let safe_ctx = MonthContext::new(2026, 99, &holidays);
+    assert_eq!(safe_ctx.month, 12, "異常な月(99)でもパニックせず 12月にクランプされること");
+
+    assert!(
+        res1.logs.iter().any(|l| l.contains("⚠️ [事前診断]")),
+        "ケース1で事前診断ログが出力されていること"
+    );
+    assert!(
+        res3.logs.iter().any(|l| l.contains("⚠️ [事前診断]")),
+        "ケース3で事前診断ログが出力されていること"
+    );
+}
+
 
 
 

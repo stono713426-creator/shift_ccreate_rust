@@ -1,7 +1,8 @@
 //! 勤務シフト自動生成システム デスクトップ GUI (`gui.rs`)
 //!
-//! Version: v1.3.0
-//! Updated: 2026-11-08 - v1.3.0 2階裏配置制約・石橋さん/長谷川さん個別ルール改修リリース同期
+//! Version: v1.3.1
+//! Updated: 2026-11-10 - v1.3.1 入力条件表の事前検証警告（日付不正・スタッフ名不一致・重複行等）のプレビュー表示対応
+//! - v1.3.0 (2026-11-08): 2階裏配置制約・石橋さん/長谷川さん個別ルール改修リリース同期
 //! - v1.2.1 (2026-11-05): 標準条件表（勤務条件表_ひな形.xlsx）の自動検出優先度整備
 //! - v1.2.0 (2026-11-01): バージョン同期・全設定完全適用対応
 //! - v1.0.0 (2026-10-31): Phase 4 実装: eframe / egui によるモダンデスクトップ GUI の完全実装
@@ -151,8 +152,15 @@ impl ShiftApp {
                 }
                 self.month_selections = selections;
                 self.update_default_output_filename(&parsed.target_months);
+                let warn_cnt = parsed.parse_warnings.len();
                 self.parsed_data = Some(parsed);
-                self.status_message = "勤務条件表の解析が完了しました。作成対象月を確認して生成を開始してください。".to_string();
+                if warn_cnt > 0 {
+                    self.status_message = format!(
+                        "勤務条件表の解析が完了しました（⚠️ 入力確認事項が {warn_cnt} 件あります。プレビュー欄をご確認ください）。"
+                    );
+                } else {
+                    self.status_message = "勤務条件表の解析が完了しました。作成対象月を確認して生成を開始してください。".to_string();
+                }
             }
             Err(e) => {
                 self.parse_error = Some(format!("Excelファイルの解析に失敗しました: {}", e));
@@ -383,6 +391,17 @@ impl eframe::App for ShiftApp {
                             let prev_str = if !parsed.prev_month_tail_shifts.is_empty() { "あり" } else { "なし" };
                             ui.label(format!("⏮ 前月実績: {}", prev_str));
                         });
+
+                        if !parsed.parse_warnings.is_empty() {
+                            ui.add_space(6.0);
+                            for warn_msg in &parsed.parse_warnings {
+                                ui.label(
+                                    RichText::new(warn_msg)
+                                        .color(Color32::from_rgb(200, 100, 0))
+                                        .strong(),
+                                );
+                            }
+                        }
 
                         ui.add_space(8.0);
                         ui.separator();

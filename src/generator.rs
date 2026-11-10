@@ -1,7 +1,8 @@
 //! 勤務シフト自動生成システム 複数月連続生成サービス (`generator.rs`)
 //!
-//! Version: v1.3.0
-//! Updated: 2026-11-08 - v1.3.0 2階裏配置制約・石橋さん/長谷川さん個別ルール改修リリース同期
+//! Version: v1.3.1
+//! Updated: 2026-11-10 - v1.3.1 対象月重複排除・事前診断ログ通知・Excelファイルロック時の自動別名保存フォールバック対応
+//! - v1.3.0 (2026-11-08): 2階裏配置制約・石橋さん/長谷川さん個別ルール改修リリース同期
 //! - v1.2.0 (2026-11-01): 前月シフト実績シートの年月整合ガード・過去最大3ヶ月主公休履歴の引き継ぎ実装
 //! - v1.0.0 (2026-10-31): Phase 3 実装: 複数月連続生成・月跨ぎ実績引き継ぎ・Excel一括レンダリング
 //!
@@ -62,7 +63,7 @@ impl ShiftGenerator {
     where
         F: FnMut(usize, usize, i32, u32, &str),
     {
-        let months = match &options.target_months {
+        let raw_months = match &options.target_months {
             Some(m) if !m.is_empty() => m.clone(),
             _ => {
                 if !parsed.target_months.is_empty() {
@@ -72,6 +73,14 @@ impl ShiftGenerator {
                 }
             }
         };
+
+        // 同一対象月の重複排除（出現順序維持）
+        let mut months = Vec::with_capacity(raw_months.len());
+        for ym in raw_months {
+            if !months.contains(&ym) {
+                months.push(ym);
+            }
+        }
 
         let output_path = match &options.output_path {
             Some(p) => p.clone(),
@@ -159,6 +168,13 @@ impl ShiftGenerator {
             // ソルバー実行
             let solve_res = solve_shift(&working_parsed, year, month, holidays);
 
+            // ソルバーからの事前診断ログがあれば進捗コールバックへ転送
+            for diag_log in &solve_res.logs {
+                if diag_log.starts_with("⚠️") {
+                    progress_cb(idx, total_months, year, month, diag_log);
+                }
+            }
+
             if solve_res.success {
                 progress_cb(
                     idx,
@@ -218,7 +234,14 @@ impl ShiftGenerator {
             results.push((year, month, solve_res));
         }
 
-        // Excel レンダリング
+        // 出力先親ディレクトリの存在保証
+        if let Some(parent) = output_path.parent() {
+            if !parent.as_os_str().is_empty() && !parent.exists() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+        }
+
+        // Excel レンダリング（既存ファイルがExcelで開かれてロックされている場合は自動で別名保存にフォールバック）
         progress_cb(
             total_months,
             total_months,
@@ -227,17 +250,63 @@ impl ShiftGenerator {
             &format!("Excel ファイルを出力中: {}", output_path.display()),
         );
 
-        render_shifts_to_file(&output_path, parsed, &results, holidays)
-            .map_err(|e| format!("Excel ファイルの保存に失敗しました: {}", e))?;
+        let mut actual_saved_path = output_path.clone();
+        if let Err(primary_err) = render_shifts_to_file(&output_path, parsed, &results, holidays) {
+            let parent_dir = output_path
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_default();
+            let stem = output_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("シフト出力");
+            let ext = output_path
+                .extension()
+                .and_then(|s| s.to_str())
+                .unwrap_or("xlsx");
+
+            let mut saved_alt = None;
+            for alt_idx in 1..=10 {
+                let alt_name = format!("{stem}_別名保存_{alt_idx}.{ext}");
+                let alt_path = if parent_dir.as_os_str().is_empty() {
+                    PathBuf::from(alt_name)
+                } else {
+                    parent_dir.join(alt_name)
+                };
+                if render_shifts_to_file(&alt_path, parsed, &results, holidays).is_ok() {
+                    saved_alt = Some(alt_path);
+                    break;
+                }
+            }
+
+            if let Some(alt_path) = saved_alt {
+                progress_cb(
+                    total_months,
+                    total_months,
+                    0,
+                    0,
+                    &format!(
+                        "⚠️ 出力先ファイルが他のプログラム（Excel等）で開かれていたため、別名ファイルへ自動保存しました: {}",
+                        alt_path.display()
+                    ),
+                );
+                actual_saved_path = alt_path;
+            } else {
+                return Err(format!(
+                    "Excel ファイルの保存に失敗しました（出力先がExcel等で開かれていないか確認してください）: {}",
+                    primary_err
+                ));
+            }
+        }
 
         progress_cb(
             total_months,
             total_months,
             0,
             0,
-            &format!("全工程完了: {}", output_path.display()),
+            &format!("全工程完了: {}", actual_saved_path.display()),
         );
 
-        Ok((output_path, results))
+        Ok((actual_saved_path, results))
     }
 }

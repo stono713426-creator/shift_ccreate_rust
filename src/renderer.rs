@@ -1,7 +1,8 @@
 //! 勤務シフト自動生成システム 現場フォーマット Excel レンダラー (`renderer.rs`)
 //!
-//! Version: v1.3.0
-//! Updated: 2026-11-08 - v1.3.0 Ope日（注射以外の手術日）における石橋さんの「2階裏（外来）人数」列数式および警告カウントからの除外対応
+//! Version: v1.3.1
+//! Updated: 2026-11-10 - v1.3.1 シート名重複回避・空リスト時のフォールバック等の防御処理強化
+//! - v1.3.0 (2026-11-08): Ope日（注射以外の手術日）における石橋さんの「2階裏（外来）人数」列数式および警告カウントからの除外対応
 //! - v1.2.0 (2026-11-01): リリースバージョン同期
 //! - v1.0.0 (2026-10-31): Phase 3 実装: SPECIFICATION.md セクション6 完全準拠の現場フォーマット Excel 出力
 //!
@@ -867,13 +868,21 @@ pub fn render_shifts_to_file<P: AsRef<Path>>(
 ) -> Result<(), XlsxError> {
     let mut workbook = Workbook::new();
     let fmt = FormatSet::new();
+    let mut used_sheet_names = std::collections::HashSet::new();
 
     for (year, month, result) in results {
-        let sheet_name = if result.success {
+        let base_sheet_name = if result.success {
             format!("{}年{:02}月シフト", year, month)
         } else {
             format!("{}年{:02}月_未生成", year, month)
         };
+        let mut sheet_name = base_sheet_name.clone();
+        let mut dup_idx = 2usize;
+        while used_sheet_names.contains(&sheet_name) {
+            sheet_name = format!("{base_sheet_name}_{dup_idx}");
+            dup_idx += 1;
+        }
+        used_sheet_names.insert(sheet_name.clone());
 
         let worksheet = workbook.add_worksheet();
         worksheet.set_name(&sheet_name)?;

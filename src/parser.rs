@@ -1,7 +1,8 @@
 //! 勤務シフト自動生成システム Excelデータ解析・日付パーサー (`parser.rs`)
 //!
-//! Version: v1.3.0
-//! Updated: 2026-11-08 - v1.3.0 「勤務形態」列・既存「職種」列からの職種(看護師/検査)判定、手術スケジュール「注射日」vs「Ope日」分離判定、PM有休(午後/半休)日付抽出対応
+//! Version: v1.3.1
+//! Updated: 2026-11-10 - v1.3.1 入力検証・防御的パース強化（重複スタッフ排除・和暦対応・存在しない日付[9/31等]の警告検出・未知スタッフ名警告・対象月自動補完）
+//! - v1.3.0 (2026-11-08): 「勤務形態」列・既存「職種」列からの職種(看護師/検査)判定、手術スケジュール「注射日」vs「Ope日」分離判定、PM有休(午後/半休)日付抽出対応
 //! - v1.2.0 (2026-11-01): パーサー全面堅牢化: 年跨ぎM/D自動年補完、同日複数OPE統合、前月実績年月認識、3ヶ月履歴初期化、パート希望出勤曜日補完、OR表記拡張
 //! - v1.1.0 (2026-10-31): シフト制約条件シートの列ヘッダー検出修正および除外フラグ大文字小文字対応
 //! - v1.0.1 (2026-10-31): 範囲日付パーサー改修(スペースなしハイフン範囲・年跨ぎ範囲対応)
@@ -136,6 +137,9 @@ pub struct ParsedExcelData {
     pub prev_sheet_year_month: Option<(i32, u32)>,
     pub prev_month_tail_shifts: HashMap<String, Vec<u8>>,
     pub existing_shifts: HashMap<(i32, u32), HashMap<String, HashMap<u32, u8>>>,
+    /// 解析時に検出された入力データの注意・警告メッセージ一覧
+    #[serde(default)]
+    pub parse_warnings: Vec<String>,
 }
 
 // ============================================================================
@@ -399,7 +403,21 @@ fn parse_single_date_with_months(
 
 /// 単一の日付文字列をパース
 fn parse_single_date(s: &str, default_year: i32) -> Option<NaiveDate> {
-    let cleaned = s.trim().replace('年', "/").replace('月', "/").replace('.', "/").replace('日', "");
+    let mut norm: String = s.nfkc().collect();
+    norm = norm.trim().to_string();
+    // 和暦（令和 / R）表記の西暦変換 (例: "令和8年9月1日", "R8.9.1", "r8/9/1")
+    let re_reiwa = Regex::new(r"^(?:令和|R|r)\s*(\d{1,2})\s*[年/.-]\s*(.+)$").unwrap();
+    if let Some(caps) = re_reiwa.captures(&norm) {
+        if let Ok(r_year) = caps[1].parse::<i32>() {
+            norm = format!("{}/{}", 2018 + r_year, &caps[2]);
+        }
+    }
+
+    let cleaned = norm
+        .replace('年', "/")
+        .replace('月', "/")
+        .replace('.', "/")
+        .replace('日', "");
     let parts: Vec<&str> = cleaned.split(['/', '-']).map(|p| p.trim()).filter(|p| !p.is_empty()).collect();
 
     match parts.len() {
@@ -426,6 +444,49 @@ fn parse_single_date(s: &str, default_year: i32) -> Option<NaiveDate> {
         }
         _ => None,
     }
+}
+
+/// セル文字列内に「9/31」「2/29(平年)」などの暦上存在しない無効な日付指定が含まれていないか検査する
+fn detect_invalid_date_strings(
+    cell: &Data,
+    default_year: i32,
+    target_months: &[(i32, u32)],
+) -> Vec<String> {
+    let mut invalid_list = Vec::new();
+    let Data::String(raw_s) = cell else {
+        return invalid_list;
+    };
+    let norm: String = raw_s.nfkc().collect();
+    let re_md = Regex::new(r"(?:(\d{2,4})[年/.-])?(\d{1,2})[月/.-](\d{1,2})日?").unwrap();
+    for caps in re_md.captures_iter(&norm) {
+        let m = match caps[2].parse::<u32>() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let d = match caps[3].parse::<u32>() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let y = if let Some(y_m) = caps.get(1) {
+            let mut parsed_y = y_m.as_str().parse::<i32>().unwrap_or(default_year);
+            if parsed_y < 100 {
+                parsed_y += 2000;
+            }
+            parsed_y
+        } else {
+            resolve_year_for_month(m, default_year, target_months)
+        };
+        if !(1..=12).contains(&m) || NaiveDate::from_ymd_opt(y, m, d).is_none() {
+            invalid_list.push(caps[0].to_string());
+        }
+    }
+    invalid_list
+}
+
+/// スタッフ氏名の正規化（NFKC正規化＋前後空白・全角空白除去）
+fn normalize_staff_name(raw: &str) -> String {
+    let norm: String = raw.nfkc().collect();
+    norm.replace('\u{3000}', " ").trim().to_string()
 }
 
 /// Excel シリアル値（1899-12-30 基準）から NaiveDate を計算
@@ -460,12 +521,19 @@ pub fn parse_shift_excel<P: AsRef<Path>>(
     holidays: &HashMap<NaiveDate, String>,
 ) -> Result<ParsedExcelData, String> {
     let path = excel_path.as_ref();
-    let mut workbook = open_workbook_auto(path).map_err(|e| format!("Excelファイルオープンエラー: {e}"))?;
+    let mut workbook = open_workbook_auto(path).map_err(|e| {
+        format!(
+            "Excelファイルオープンエラー: {e}（Excel等で開かれている場合や壊れている場合は閉じてから再度お試しください）"
+        )
+    })?;
 
     let sheet_names = workbook.sheet_names().to_vec();
     if sheet_names.is_empty() {
         return Err("Excel内にシートが存在しません。".to_string());
     }
+
+    let mut parse_warnings: Vec<String> = Vec::new();
+    let mut all_known_staff_names: HashSet<String> = HashSet::new();
 
     // 1. 設定シート (config) の探索とパース
     let mut config = ShiftConfig::default();
@@ -511,7 +579,15 @@ pub fn parse_shift_excel<P: AsRef<Path>>(
         .unwrap_or(&sheet_names[0]);
 
     let staffs = if let Ok(range) = workbook.worksheet_range(staff_sheet_name) {
-        parse_staff_sheet(&range, default_year, &target_months, holidays, &config)?
+        parse_staff_sheet(
+            &range,
+            default_year,
+            &target_months,
+            holidays,
+            &config,
+            &mut parse_warnings,
+            &mut all_known_staff_names,
+        )?
     } else {
         return Err(format!("スタッフマスタシート '{staff_sheet_name}' を読み込めません。"));
     };
@@ -535,6 +611,20 @@ pub fn parse_shift_excel<P: AsRef<Path>>(
         }
     }
 
+    // 4.1 制約ルールの対象スタッフ名チェック（タイポ・未登録名検知）
+    if !all_known_staff_names.is_empty() {
+        for rule in &rules {
+            for target_name in &rule.target_staffs {
+                if !all_known_staff_names.contains(target_name) {
+                    parse_warnings.push(format!(
+                        "⚠️ [制約スタッフ名警告] シフト制約条件『{}』の対象スタッフ『{}』がスタッフマスタに存在しません（表記ゆれ・誤字の可能性があります）。",
+                        rule.name, target_name
+                    ));
+                }
+            }
+        }
+    }
+
     // 5. 前月実績シートの探索とパース
     let mut prev_month_main_offs = HashMap::new();
     let mut prev_month_main_offs_history: HashMap<String, Vec<u32>> = HashMap::new();
@@ -554,6 +644,41 @@ pub fn parse_shift_excel<P: AsRef<Path>>(
     }
     for (staff_name, &w) in &prev_month_main_offs {
         prev_month_main_offs_history.insert(staff_name.clone(), vec![w]);
+    }
+
+    // 5.1 手術スケジュールから対象月が1件も得られなかった場合のフォールバック補完
+    if target_months.is_empty() {
+        let mut fallback_months = HashSet::new();
+        for s in &staffs {
+            for d in s
+                .vacation_dates
+                .iter()
+                .chain(s.special_vacation_dates.iter())
+                .chain(s.preferred_off_dates.iter())
+                .chain(s.specified_off_dates.iter())
+            {
+                fallback_months.insert((d.year(), d.month()));
+            }
+        }
+        if fallback_months.is_empty() {
+            if let Some((py, pm)) = prev_sheet_year_month {
+                let (ny, nm) = if pm == 12 { (py + 1, 1) } else { (py, pm + 1) };
+                fallback_months.insert((ny, nm));
+            }
+        }
+        if !fallback_months.is_empty() {
+            let mut sorted_fb: Vec<(i32, u32)> = fallback_months.into_iter().collect();
+            sorted_fb.sort_unstable();
+            let desc = sorted_fb
+                .iter()
+                .map(|(y, m)| format!("{y}年{m}月"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            parse_warnings.push(format!(
+                "⚠️ [対象月補完] 手術スケジュールから対象月を検出できなかったため、スタッフ休暇日・前月実績から対象月（{desc}）を自動推定しました。"
+            ));
+            target_months = sorted_fb;
+        }
     }
 
     // 6. 既存生成シフトシートの探索 (例: "2024年09月シフト", "24年09月シフト")
@@ -586,6 +711,7 @@ pub fn parse_shift_excel<P: AsRef<Path>>(
         prev_sheet_year_month,
         prev_month_tail_shifts,
         existing_shifts,
+        parse_warnings,
     })
 }
 
@@ -737,6 +863,8 @@ fn parse_staff_sheet(
     target_months: &[(i32, u32)],
     holidays: &HashMap<NaiveDate, String>,
     config: &ShiftConfig,
+    parse_warnings: &mut Vec<String>,
+    all_known_staff_names: &mut HashSet<String>,
 ) -> Result<Vec<Staff>, String> {
     let rows: Vec<&[Data]> = range.rows().collect();
     if rows.is_empty() {
@@ -801,16 +929,20 @@ fn parse_staff_sheet(
 
     let c_name = col_name.unwrap_or(0);
     let mut staffs = Vec::new();
+    let mut seen_active_names: HashSet<String> = HashSet::new();
 
     for (r_idx, row) in rows.iter().enumerate().skip(header_row_idx + 1) {
         if row.len() <= c_name {
             continue;
         }
 
-        let name = row[c_name].to_string().trim().to_string();
+        let name = normalize_staff_name(&row[c_name].to_string());
         if name.is_empty() || name.contains("合計") || name.contains("人数") {
             continue;
         }
+
+        // 除外判定前でもスタッフマスタ登録者として記録（除外スタッフが制約条件シートに残っている場合の誤警告防止）
+        all_known_staff_names.insert(name.clone());
 
         // 除外列判定
         if let Some(c_ex) = col_exclude {
@@ -823,6 +955,33 @@ fn parse_staff_sheet(
                     || ex_val.contains("除外")
                 {
                     continue;
+                }
+            }
+        }
+
+        // 同名スタッフ重複チェック
+        if !seen_active_names.insert(name.clone()) {
+            parse_warnings.push(format!(
+                "⚠️ [重複スタッフ警告] スタッフマスタに同名スタッフ『{name}』（{}行目）が重複登録されています。後続の重複行をスキップしました。",
+                r_idx + 1
+            ));
+            continue;
+        }
+
+        // 各休暇・公休セルに存在しない日付（例: 9/31, 平年2/29）が含まれていないか検証
+        let leave_col_labels = [
+            (col_vacation, "有休"),
+            (col_special_vacation, "特別有休"),
+            (col_preferred_off, "希望休"),
+            (col_specified_off, "指定公休"),
+        ];
+        for (col_opt, col_label) in leave_col_labels {
+            if let Some(cell) = col_opt.and_then(|c| row.get(c)) {
+                let invalid_tokens = detect_invalid_date_strings(cell, default_year, target_months);
+                for bad_tok in invalid_tokens {
+                    parse_warnings.push(format!(
+                        "⚠️ [日付入力警告] スタッフ『{name}』の{col_label}欄に存在しない日付『{bad_tok}』が含まれています（無視されました）。"
+                    ));
                 }
             }
         }
@@ -976,6 +1135,10 @@ fn parse_staff_sheet(
         staffs.push(staff);
     }
 
+    if staffs.is_empty() {
+        return Err("有効なスタッフが1名も登録されていません（全員除外またはシートが空です）。".to_string());
+    }
+
     Ok(staffs)
 }
 
@@ -1096,7 +1259,7 @@ fn parse_rules_sheet(range: &Range<Data>, rules: &mut Vec<ShiftRule>) {
         let staffs_str = col_staffs.and_then(|c| row.get(c)).map(|d| d.to_string().trim().to_string()).unwrap_or_default();
         let target_staffs: Vec<String> = staffs_str
             .split([',', '、', ';', '・', '/', ' '])
-            .map(|s| s.trim().to_string())
+            .map(normalize_staff_name)
             .filter(|s| !s.is_empty())
             .collect();
 
@@ -1171,7 +1334,7 @@ fn parse_prev_month_sheet(
         let mut staff_cols = Vec::new();
 
         for (c_idx, cell) in header_row.iter().enumerate().skip(4) {
-            let s = cell.to_string().trim().to_string();
+            let s = normalize_staff_name(&cell.to_string());
             if !s.is_empty()
                 && !s.contains("人数")
                 && !s.contains("総出勤")
@@ -1268,7 +1431,7 @@ fn parse_prev_month_sheet(
             if row.is_empty() {
                 continue;
             }
-            let name = row[0].to_string().trim().to_string();
+            let name = normalize_staff_name(&row[0].to_string());
             if name.is_empty() || name.contains("合計") {
                 continue;
             }
@@ -1297,7 +1460,7 @@ fn parse_existing_shift_sheet(range: &Range<Data>) -> Option<HashMap<String, Has
     let header_row = rows[1]; // 通常行2がヘッダー
     let mut staff_cols = Vec::new();
     for (c_idx, cell) in header_row.iter().enumerate().skip(4) {
-        let s = cell.to_string().trim().to_string();
+        let s = normalize_staff_name(&cell.to_string());
         if !s.is_empty()
             && !s.contains("人数")
             && !s.contains("総出勤")
@@ -1356,6 +1519,18 @@ mod tests {
         assert!(dates.contains(&NaiveDate::from_ymd_opt(2024, 9, 5).unwrap()));
         assert!(dates.contains(&NaiveDate::from_ymd_opt(2024, 9, 7).unwrap()));
         assert_eq!(dates.len(), 5);
+    }
+
+    #[test]
+    fn test_parse_reiwa_and_invalid_date_detection() {
+        let cell = Data::String("令和8年9月10日, R8/9/15, 9/31".to_string());
+        let dates = parse_date_list(&cell, 2026, None);
+        assert!(dates.contains(&NaiveDate::from_ymd_opt(2026, 9, 10).unwrap()));
+        assert!(dates.contains(&NaiveDate::from_ymd_opt(2026, 9, 15).unwrap()));
+        assert_eq!(dates.len(), 2);
+
+        let invalid = detect_invalid_date_strings(&cell, 2026, &[(2026, 9)]);
+        assert_eq!(invalid, vec!["9/31".to_string()]);
     }
 
     #[test]
