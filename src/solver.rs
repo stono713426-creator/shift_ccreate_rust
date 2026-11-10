@@ -316,7 +316,11 @@ pub fn compute_ishibashi_week_plans(
 
         // 週4日出勤基準（個人の有休・夏休取得日がある週はその日数分を控除して集計行のマイナス処理と整合させる）
         let desired_full = (4 - personal_vac_cnt).max(0);
-        let max_consec = data.config.max_consecutive_work_days as i32;
+        let max_consec = if data.config.max_consecutive_work_days > 0 {
+            data.config.max_consecutive_work_days as i32
+        } else {
+            7
+        };
         let full_week_target = desired_full
             .min(avail_all)
             .max(forced_all)
@@ -378,8 +382,11 @@ pub fn compute_ishibashi_week_plans(
                 .max(forced_curr)
                 .min(max_consec)
         } else {
-            // 当月完結週: 祝日の有無にかかわらず原則4日（物理上限・Ope必須下限でクランプ）
-            full_week_target.min(avail_curr).max(forced_curr)
+            // 当月完結週: 祝日の有無にかかわらず原則4日（物理上限・Ope必須下限・連勤上限でクランプ）
+            full_week_target
+                .min(avail_curr)
+                .max(forced_curr)
+                .min(max_consec)
         };
 
         let wed_day = if in_curr[2] && is_avail[2] {
@@ -2085,10 +2092,10 @@ fn build_and_solve_stage(
             || hard_weeks_2f_nurse.len() < total_weeks
             || hard_weeks_2f_exam.len() < total_weeks
         {
-            logs.push(
-                "⚠️ [事前診断] 2階裏（外来）の週次・月次供給上限（公休・有休・連勤制限）に対し日次最低人数の合計が超過する週を検出したため、該当週をスラック高優先維持モードへ自動切替しました。"
-                    .to_string(),
-            );
+            logs.push(format!(
+                "⚠️ [事前診断] 2階裏（外来）の週次・月次供給上限（公休・有休・連勤制限）に対し日次最低人数の合計が超過する週を検出したため、該当週をスラック高優先維持モードへ自動切替しました (total_hard={:?}, nurse_hard={:?}, exam_hard={:?})。",
+                hard_weeks_2f_total, hard_weeks_2f_nurse, hard_weeks_2f_exam
+            ));
         }
     }
 
@@ -2097,7 +2104,6 @@ fn build_and_solve_stage(
         if common_sp_vac.contains(&date) {
             continue;
         }
-        let w = ctx.weekday_map[&d];
         let w_idx = day_to_week_idx.get(&d).copied().unwrap_or(0);
 
         // --------------------------------------------------------------------
@@ -2540,12 +2546,24 @@ fn build_and_solve_stage(
         }
 
         let hard_weeks_rule = if is_hard && stage == 1 {
-            evaluate_group_hard_weeks(
+            let hw = evaluate_group_hard_weeks(
                 &target_staff_refs,
                 false,
                 &day_reqs_rule,
                 &mut forced_work_days,
-            )
+            );
+            let active_weeks: HashSet<usize> = day_reqs_rule
+                .iter()
+                .filter(|(_, (req, _))| *req > 0)
+                .filter_map(|(d, _)| day_to_week_idx.get(d).copied())
+                .collect();
+            if active_weeks.iter().any(|w| !hw.contains(w)) {
+                logs.push(format!(
+                    "⚠️ [事前診断] シフト制約条件『{}({})』のHARD制約が週次・月次供給上限（公休・連勤制限等）を超過する週を検出したため、該当週をスラック高優先維持モードへ自動切替しました (hard_weeks={:?})。",
+                    rule.name, rule.condition_desc, hw
+                ));
+            }
+            hw
         } else {
             HashSet::new()
         };

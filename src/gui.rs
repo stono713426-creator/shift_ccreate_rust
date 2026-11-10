@@ -1,7 +1,8 @@
 //! 勤務シフト自動生成システム デスクトップ GUI (`gui.rs`)
 //!
-//! Version: v1.3.1
-//! Updated: 2026-11-10 - v1.3.1 入力条件表の事前検証警告（日付不正・スタッフ名不一致・重複行等）のプレビュー表示対応
+//! Version: v1.3.2
+//! Updated: 2026-11-10 - v1.3.2 外部Excel起動時の一瞬コンソール表示抑止 (CREATE_NO_WINDOW)
+//! - v1.3.1 (2026-11-10): 入力条件表の事前検証警告（日付不正・スタッフ名不一致・重複行等）のプレビュー表示対応
 //! - v1.3.0 (2026-11-08): 2階裏配置制約・石橋さん/長谷川さん個別ルール改修リリース同期
 //! - v1.2.1 (2026-11-05): 標準条件表（勤務条件表_ひな形.xlsx）の自動検出優先度整備
 //! - v1.2.0 (2026-11-01): バージョン同期・全設定完全適用対応
@@ -596,9 +597,15 @@ pub fn find_local_condition_excel() -> Option<PathBuf> {
 /// OS の既定アプリケーションでファイルを開く
 pub fn open_file_in_os(path: &Path) {
     let path_str = path.to_string_lossy().to_string();
-    let _ = std::process::Command::new("cmd")
-        .args(["/c", "start", "", &path_str])
-        .spawn();
+    let mut cmd = std::process::Command::new("cmd");
+    cmd.args(["/c", "start", "", &path_str]);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let _ = cmd.spawn();
 }
 
 /// エクスプローラーでフォルダを開きファイルを選択表示する

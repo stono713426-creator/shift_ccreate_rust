@@ -1,7 +1,8 @@
 //! 勤務シフト自動生成システム Excelデータ解析・日付パーサー (`parser.rs`)
 //!
-//! Version: v1.3.1
-//! Updated: 2026-11-10 - v1.3.1 入力検証・防御的パース強化（重複スタッフ排除・和暦対応・存在しない日付[9/31等]の警告検出・未知スタッフ名警告・対象月自動補完）
+//! Version: v1.3.2
+//! Updated: 2026-11-10 - v1.3.2 Excel単体日付セル（2/15等）の対象月年解決対応（2月15日自動変換時の年不一致による反映漏れ修正）
+//! - v1.3.1 (2026-11-10): 入力検証・防御的パース強化（重複スタッフ排除・和暦対応・存在しない日付[9/31等]の警告検出・未知スタッフ名警告・対象月自動補完）
 //! - v1.3.0 (2026-11-08): 「勤務形態」列・既存「職種」列からの職種(看護師/検査)判定、手術スケジュール「注射日」vs「Ope日」分離判定、PM有休(午後/半休)日付抽出対応
 //! - v1.2.0 (2026-11-01): パーサー全面堅牢化: 年跨ぎM/D自動年補完、同日複数OPE統合、前月実績年月認識、3ヶ月履歴初期化、パート希望出勤曜日補完、OR表記拡張
 //! - v1.1.0 (2026-10-31): シフト制約条件シートの列ヘッダー検出修正および除外フラグ大文字小文字対応
@@ -172,28 +173,47 @@ pub fn parse_date_list_for_months(
         Data::DateTime(dt) => {
             let (y, m, d, _, _, _, _) = dt.to_ymd_hms_milli();
             if let Some(date) = NaiveDate::from_ymd_opt(y as i32, m as u32, d as u32) {
-                dates.insert(date);
+                if let Some(resolved) = resolve_excel_date_for_months(date, target_months) {
+                    dates.insert(resolved);
+                }
             }
         }
         Data::DateTimeIso(s) => {
-            if let Ok(d) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
-                dates.insert(d);
-            } else if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
-                dates.insert(dt.date());
+            let trimmed_iso = s.trim();
+            let parsed_iso = NaiveDate::parse_from_str(trimmed_iso, "%Y-%m-%d")
+                .ok()
+                .or_else(|| {
+                    chrono::NaiveDateTime::parse_from_str(trimmed_iso, "%Y-%m-%d %H:%M:%S")
+                        .ok()
+                        .map(|dt| dt.date())
+                })
+                .or_else(|| {
+                    chrono::NaiveDateTime::parse_from_str(trimmed_iso, "%Y-%m-%dT%H:%M:%S")
+                        .ok()
+                        .map(|dt| dt.date())
+                });
+            if let Some(date) = parsed_iso {
+                if let Some(resolved) = resolve_excel_date_for_months(date, target_months) {
+                    dates.insert(resolved);
+                }
             }
         }
         Data::Int(i) => {
             let val = *i as f64;
             if (30000.0..=60000.0).contains(&val) {
-                if let Some(d) = excel_serial_to_date(val) {
-                    dates.insert(d);
+                if let Some(date) = excel_serial_to_date(val) {
+                    if let Some(resolved) = resolve_excel_date_for_months(date, target_months) {
+                        dates.insert(resolved);
+                    }
                 }
             }
         }
         Data::Float(f) => {
             if (30000.0..=60000.0).contains(f) {
-                if let Some(d) = excel_serial_to_date(*f) {
-                    dates.insert(d);
+                if let Some(date) = excel_serial_to_date(*f) {
+                    if let Some(resolved) = resolve_excel_date_for_months(date, target_months) {
+                        dates.insert(resolved);
+                    }
                 }
             }
         }
@@ -210,8 +230,12 @@ pub fn parse_date_list_for_months(
             if re_serial.is_match(trimmed) {
                 if let Ok(num) = trimmed.parse::<f64>() {
                     if (30000.0..=60000.0).contains(&num) {
-                        if let Some(d) = excel_serial_to_date(num) {
-                            dates.insert(d);
+                        if let Some(date) = excel_serial_to_date(num) {
+                            if let Some(resolved) =
+                                resolve_excel_date_for_months(date, target_months)
+                            {
+                                dates.insert(resolved);
+                            }
                             return filter_holidays_sundays(dates, holidays_jp_dict);
                         }
                     }
@@ -294,6 +318,24 @@ fn resolve_year_for_month(month: u32, default_year: i32, target_months: &[(i32, 
         return y;
     }
     default_year
+}
+
+/// Excel の日付型・シリアル値として取得された日付について、作成対象月 (`target_months`) との照合で年を解決する。
+/// Excel で年を省略して単体入力（例:「2/15」）した際に付与される入力年の日付（例: 2026-02-15）を、
+/// 対象月（例: 2027年2月）の年（2027-02-15）へ自動解決するために使用する。
+fn resolve_excel_date_for_months(
+    date: NaiveDate,
+    target_months: &[(i32, u32)],
+) -> Option<NaiveDate> {
+    let y = date.year();
+    let m = date.month();
+    let d = date.day();
+    if !target_months.is_empty() && !target_months.contains(&(y, m)) {
+        if let Some(&(resolved_y, _)) = target_months.iter().find(|&&(_, tm)| tm == m) {
+            return NaiveDate::from_ymd_opt(resolved_y, m, d);
+        }
+    }
+    Some(date)
 }
 
 /// トークン文字列から日付範囲または単一日付を抽出し dates に追加
@@ -1611,5 +1653,54 @@ mod tests {
         };
         assert!(!s_exam.is_nurse());
         assert!(s_exam.is_exam());
+    }
+
+    #[test]
+    fn test_excel_serial_single_date_year_resolution() {
+        use calamine::{ExcelDateTime, ExcelDateTimeType};
+
+        let target_months = vec![
+            (2026, 9),
+            (2026, 10),
+            (2026, 11),
+            (2026, 12),
+            (2027, 1),
+            (2027, 2),
+            (2027, 3),
+        ];
+        let holidays = HashMap::new();
+
+        // 2026年に Excel で「2/15」と単体入力したときに生成される DateTime (46068.0 = 2026-02-15 日曜)
+        // 日曜・祝日フィルタありでも先に 2027-02-15 (月曜) へ解決され、消えずに残ること
+        let dt_cell = Data::DateTime(ExcelDateTime::new(
+            46068.0,
+            ExcelDateTimeType::DateTime,
+            false,
+        ));
+        let dates_dt = parse_date_list_for_months(&dt_cell, 2026, &target_months, Some(&holidays));
+        assert_eq!(dates_dt.len(), 1);
+        assert!(dates_dt.contains(&NaiveDate::from_ymd_opt(2027, 2, 15).unwrap()));
+
+        // DateTimeIso / Float / String("2/15、") でも同様に 2027-02-15 になること
+        let iso_cell = Data::DateTimeIso("2026-02-15".to_string());
+        let dates_iso =
+            parse_date_list_for_months(&iso_cell, 2026, &target_months, Some(&holidays));
+        assert!(dates_iso.contains(&NaiveDate::from_ymd_opt(2027, 2, 15).unwrap()));
+
+        let float_cell = Data::Float(46068.0);
+        let dates_float =
+            parse_date_list_for_months(&float_cell, 2026, &target_months, Some(&holidays));
+        assert!(dates_float.contains(&NaiveDate::from_ymd_opt(2027, 2, 15).unwrap()));
+
+        let str_cell = Data::String("2/15、".to_string());
+        let dates_str =
+            parse_date_list_for_months(&str_cell, 2026, &target_months, Some(&holidays));
+        assert!(dates_str.contains(&NaiveDate::from_ymd_opt(2027, 2, 15).unwrap()));
+
+        // 対象月に (2026, 11) 自体が含まれている場合は 2026-11-10 のまま維持されること
+        let iso_nov = Data::DateTimeIso("2026-11-10".to_string());
+        let dates_nov =
+            parse_date_list_for_months(&iso_nov, 2026, &target_months, Some(&holidays));
+        assert!(dates_nov.contains(&NaiveDate::from_ymd_opt(2026, 11, 10).unwrap()));
     }
 }

@@ -1,7 +1,8 @@
 //! 勤務シフト自動生成システム 統合回帰テストスイート (`tests/regression_suite.rs`)
 //!
-//! Version: v1.3.1
-//! Updated: 2026-11-10 - v1.3.1 test_14 連勤上限・希望休超過・Ope集中週・HARDペア全休時のソルバー破綻＆重み逆転防止検証追加
+//! Version: v1.3.2
+//! Updated: 2026-11-10 - v1.3.2 test_15 Excel単体日付セル（2/15→2026-02-15シリアル値）の翌年補完＆2027年2月ソルブ反映検証追加
+//! - v1.3.1 (2026-11-10): test_14 連勤上限・希望休超過・Ope集中週・HARDペア全休時のソルバー破綻＆重み逆転防止検証追加
 //! - v1.3.0 (2026-11-08): test_13 2階裏職種判定・Ope日/注射日・石橋さん週4固定＆条件付水曜公休＆Ope外来除外・曜日別職種人数・土曜PM有休例外・早上がり重複補填・7ヶ月連続Stage1検証追加
 //! - v1.2.1 (2026-11-05): 標準開発条件表として「勤務条件表_ひな形.xlsx」を採用
 //! - v1.2.0 (2026-11-01): test_12 石橋特別枠・2階裏基本人数・3ヶ月ローテーション・OPEタイポ吸収・年跨ぎ年補完・前月実績年月ガード検証
@@ -1245,7 +1246,7 @@ fn test_14_v1_3_1_conflict_and_crash_prevention() {
     // ------------------------------------------------------------------------
     // ケース1 (Category 1):
     //   - 石橋さんの前月末尾シフトが5連勤 [1,1,1,1,1] かつ 当月1日(9/1)が Ope日（必須出勤）
-    //   - 非コアスタッフ（加藤さん）の基本公休が空欄（週6稼働設定）で連勤上限(5日)と衝突する設定
+    //   - 非コアスタッフ（後藤さん）の基本公休が空欄（週6稼働設定）で連勤上限(5日)と衝突する設定
     // ------------------------------------------------------------------------
     let mut case1 = parsed.clone();
     case1
@@ -1254,23 +1255,26 @@ fn test_14_v1_3_1_conflict_and_crash_prevention() {
     case1
         .ope_dict
         .insert(NaiveDate::from_ymd_opt(2026, 9, 1).unwrap(), "Vit,cat".to_string());
-    if let Some(kato) = case1.staffs.iter_mut().find(|s| s.name == "加藤") {
-        kato.basic_off_days.clear();
-    }
+    let goto = case1
+        .staffs
+        .iter_mut()
+        .find(|s| s.name == "後藤")
+        .expect("ひな形に後藤さんが存在すること");
+    goto.basic_off_days.clear();
     let res1 = solve_shift(&case1, 2026, 9, &holidays);
     assert!(
         res1.success && res1.stage == 1,
         "ケース1（前月5連勤＋1日Ope必須＋非コア週6設定）がクラッシュせず Stage 1 で解けること"
     );
     assert_eq!(res1.shifts["石橋"][&1], 1, "石橋さんが 9/1(Ope日) に出勤できていること");
-    // 加藤さんが月内で5連勤上限を守っていること
-    let mut kato_streak = 0;
+    // 後藤さんが月内で5連勤上限を守っていること
+    let mut goto_streak = 0;
     for d in 1..=30 {
-        if res1.shifts["加藤"][&d] == 1 {
-            kato_streak += 1;
-            assert!(kato_streak <= 5, "非コアスタッフ（加藤）も5連勤上限を守っていること");
+        if res1.shifts["後藤"][&d] == 1 {
+            goto_streak += 1;
+            assert!(goto_streak <= 5, "非コアスタッフ（後藤）も5連勤上限を守っていること");
         } else {
-            kato_streak = 0;
+            goto_streak = 0;
         }
     }
 
@@ -1315,7 +1319,10 @@ fn test_14_v1_3_1_conflict_and_crash_prevention() {
     let res3 = solve_shift(&case3, 2026, 9, &holidays);
     assert!(
         res3.success && res3.stage == 1,
-        "ケース3（週6日すべてOpe日の極端な週）でも供給量ガードにより Stage 1 で破綻せず解けること"
+        "ケース3（週6日すべてOpe日の極端な週）でも供給量ガードにより Stage 1 で破綻せず解けること (success={}, stage={}, logs={:?})",
+        res3.success,
+        res3.stage,
+        res3.logs
     );
     let ishi_w1_sum: u32 = (7..=12).map(|d| res3.shifts["石橋"][&d] as u32).sum();
     assert!(
@@ -1361,7 +1368,7 @@ fn test_14_v1_3_1_conflict_and_crash_prevention() {
     );
 
     let reiwa_cell = calamine::Data::String("令和8年9月15日, R8/9/18".to_string());
-    let reiwa_dates = shift_create_rust::parser::parse_date_list(&reiwa_cell, 2026, None);
+    let reiwa_dates = parse_date_list(&reiwa_cell, 2026, None);
     assert!(reiwa_dates.contains(&NaiveDate::from_ymd_opt(2026, 9, 15).unwrap()));
     assert!(reiwa_dates.contains(&NaiveDate::from_ymd_opt(2026, 9, 18).unwrap()));
 
@@ -1375,6 +1382,101 @@ fn test_14_v1_3_1_conflict_and_crash_prevention() {
     assert!(
         res3.logs.iter().any(|l| l.contains("⚠️ [事前診断]")),
         "ケース3で事前診断ログが出力されていること"
+    );
+}
+
+// ============================================================================
+// 15. test_15_v1_3_2_excel_datetime_single_date_and_regression:
+//     Excel で「2/15」を単体入力して「2月15日(2026-02-15)」の日付型セルに変換されても、
+//     対象月（2026年9月〜2027年3月）に合わせて 2027-02-15 の有休として正しく生成に反映されること
+// ============================================================================
+#[test]
+fn test_15_v1_3_2_excel_datetime_single_date_and_regression() {
+    use calamine::{ExcelDateTime, ExcelDateTimeType};
+    use rust_xlsxwriter::{ExcelDateTime as WxDateTime, Format as WxFormat, Workbook as WxWorkbook};
+
+    let holidays = get_holidays(2024, 2030);
+
+    // 1. 実 Excel ファイル上での単体日付セル（DateTime 2026-02-15、表示書式 "m月d日"）読み込み E2E 検証
+    let tmp_xlsx = PathBuf::from("target/test_v1_3_2_single_date.xlsx");
+    let _ = fs::remove_file(&tmp_xlsx);
+    {
+        let mut wb = WxWorkbook::new();
+        {
+            let ws = wb.add_worksheet();
+            ws.set_name("スタッフマスタ").unwrap();
+            ws.write_string(0, 0, "氏名").unwrap();
+            ws.write_string(0, 1, "所属").unwrap();
+            ws.write_string(0, 2, "職種").unwrap();
+            ws.write_string(0, 3, "雇用形態").unwrap();
+            ws.write_string(0, 4, "基本勤務パターン").unwrap();
+            ws.write_string(0, 5, "有休（指定日）").unwrap();
+
+            ws.write_string(1, 0, "小島").unwrap();
+            ws.write_string(1, 1, "2階裏").unwrap();
+            ws.write_string(1, 2, "スタッフ").unwrap();
+            ws.write_string(1, 3, "正社員").unwrap();
+            ws.write_string(1, 4, "週5日").unwrap();
+            // Excel が「2/15」単体入力時に自動作成する 2026-02-15 の日付シリアルセル＋「2月15日」書式
+            let dt = WxDateTime::from_ymd(2026, 2, 15).unwrap();
+            let fmt_md = WxFormat::new().set_num_format("m\"月\"d\"日\"");
+            ws.write_with_format(1, 5, &dt, &fmt_md).unwrap();
+        }
+        {
+            let ws = wb.add_worksheet();
+            ws.set_name("手術スケジュール").unwrap();
+            ws.write_string(0, 0, "日付").unwrap();
+            ws.write_string(0, 1, "手術種別").unwrap();
+            ws.write_string(1, 0, "2026-09-02").unwrap();
+            ws.write_string(1, 1, "Vit,cat").unwrap();
+            ws.write_string(2, 0, "2027-02-03").unwrap();
+            ws.write_string(2, 1, "cat").unwrap();
+        }
+        wb.save(&tmp_xlsx).unwrap();
+    }
+
+    let parsed_tmp = parse_shift_excel(&tmp_xlsx, &holidays).expect("単体日付テストExcel読込成功");
+    let _ = fs::remove_file(&tmp_xlsx);
+    let kojima_tmp = parsed_tmp
+        .staffs
+        .iter()
+        .find(|s| s.name == "小島")
+        .expect("小島さんが読み込まれていること");
+    assert!(
+        kojima_tmp
+            .vacation_dates
+            .contains(&NaiveDate::from_ymd_opt(2027, 2, 15).unwrap()),
+        "Excel日付型セル 2026-02-15 が対象月の 2027-02-15 としてパースされること: {:?}",
+        kojima_tmp.vacation_dates
+    );
+
+    // 2. 標準ひな形で小島さんの有休欄に ExcelDateTime(2026-02-15) が入力された場合の 2027年2月 シフト生成検証
+    let (mut parsed, _) = load_test_excel();
+    let single_dt_cell = calamine::Data::DateTime(ExcelDateTime::new(
+        46068.0, // 2026-02-15
+        ExcelDateTimeType::DateTime,
+        false,
+    ));
+    let parsed_vac = parse_date_list_for_months(
+        &single_dt_cell,
+        2026,
+        &parsed.target_months,
+        Some(&holidays),
+    );
+    assert!(parsed_vac.contains(&NaiveDate::from_ymd_opt(2027, 2, 15).unwrap()));
+
+    if let Some(kojima) = parsed.staffs.iter_mut().find(|s| s.name == "小島") {
+        kojima.vacation_dates.extend(parsed_vac);
+    }
+
+    let res_feb = solve_shift(&parsed, 2027, 2, &holidays);
+    assert!(
+        res_feb.success && res_feb.stage == 1,
+        "2027年2月のシフトが Stage 1 で解けること"
+    );
+    assert_eq!(
+        res_feb.shifts["小島"][&15], 0,
+        "2027年2月15日(月)が有休指定どおり休み(0)になること"
     );
 }
 

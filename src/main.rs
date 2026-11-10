@@ -1,7 +1,8 @@
 //! 勤務シフト自動生成システム エントリーポイント (`main.rs`)
 //!
-//! Version: v1.3.1
-//! Updated: 2026-11-10 - v1.3.1 ソルバー破綻防止（連勤上限スラック・希望休上限クランプ・週次/月次供給量ガード）および重み逆転防止対応
+//! Version: v1.3.2
+//! Updated: 2026-11-10 - v1.3.2 Windows GUIサブシステム化（ダブルクリック起動時のコンソール非表示）およびCLI実行時AttachConsole対応
+//! - v1.3.1 (2026-11-10): ソルバー破綻防止（連勤上限スラック・希望休上限クランプ・週次/月次供給量ガード）および重み逆転防止対応
 //! - v1.3.0 (2026-11-08): 2階裏人数・職種バランス強化および石橋さん・長谷川さん個別勤務ルール対応
 //! - v1.2.1 (2026-11-05): 勤務条件表_ひな形.xlsxを標準条件表に設定および配布パッケージ同梱対応
 //! - v1.2.0 (2026-11-01): 全設定・全数理条件の完全適用および勤務条件表パーサー堅牢化
@@ -9,9 +10,11 @@
 //! - v1.0.1 (2026-10-31): スペースなしハイフン日付範囲パース対応 (小島さんの特別有休反映等)
 //!
 //! 使い方:
-//!   - デスクトップ GUI 起動: `shift_create_rust.exe` (引数なし起動)
+//!   - デスクトップ GUI 起動: `shift_create_rust.exe` (引数なし起動・コンソール非表示)
 //!   - CLI バッチ実行      : `shift_create_rust.exe <入力Excelパス> [出力Excelパス]`
 //!   - ヘルプ表示          : `shift_create_rust.exe --help`
+
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 use shift_core::generator::{GenerateOptions, ShiftGenerator};
 use shift_core::gui::run_gui;
@@ -22,17 +25,43 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+/// CLI モード時のみ呼び出し元の親コンソールへ接続する（GUI起動時はコンソールを表示しないため呼ばない）
+#[cfg(target_os = "windows")]
+fn attach_parent_console() {
+    const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn AttachConsole(dw_process_id: u32) -> i32;
+    }
+    // SAFETY: Win32 API AttachConsole に定数 ATTACH_PARENT_PROCESS (0xFFFF_FFFF) を渡すのみで未定義動作はない。
+    unsafe {
+        let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn attach_parent_console() {}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
 
-    // 引数なし、または --gui 指定時: デスクトップ GUI を起動
+    // 引数なし、または --gui 指定時: デスクトップ GUI を起動（コンソールウィンドウなし）
     if args.len() < 2 || (args.len() == 2 && args[1] == "--gui") {
         if let Err(e) = run_gui() {
+            attach_parent_console();
             eprintln!("GUI の起動に失敗しました: {}", e);
+            rfd::MessageDialog::new()
+                .set_level(rfd::MessageLevel::Error)
+                .set_title("起動エラー - 勤務シフト自動生成システム")
+                .set_description(format!("GUI の起動に失敗しました:\n{}", e))
+                .show();
             std::process::exit(1);
         }
         return;
     }
+
+    // CLI モード実行時のみ親ターミナルへ出力を接続
+    attach_parent_console();
 
     // ヘルプオプション判定
     if args[1] == "--help" || args[1] == "-h" {
