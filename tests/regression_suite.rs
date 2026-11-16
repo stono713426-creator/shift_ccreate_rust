@@ -1,7 +1,8 @@
 //! 勤務シフト自動生成システム 統合回帰テストスイート (`tests/regression_suite.rs`)
 //!
-//! Version: v1.3.2
-//! Updated: 2026-11-10 - v1.3.2 test_15 Excel単体日付セル（2/15→2026-02-15シリアル値）の翌年補完＆2027年2月ソルブ反映検証追加
+//! Version: v1.3.3
+//! Updated: 2026-11-17 - v1.3.3 test_16 手術種別4種統一（Vit,cat→vit扱い）＆新ひな形「作成対象」列廃止検証追加
+//! - v1.3.2 (2026-11-10): test_15 Excel単体日付セル（2/15→2026-02-15シリアル値）の翌年補完＆2027年2月ソルブ反映検証追加
 //! - v1.3.1 (2026-11-10): test_14 連勤上限・希望休超過・Ope集中週・HARDペア全休時のソルバー破綻＆重み逆転防止検証追加
 //! - v1.3.0 (2026-11-08): test_13 2階裏職種判定・Ope日/注射日・石橋さん週4固定＆条件付水曜公休＆Ope外来除外・曜日別職種人数・土曜PM有休例外・早上がり重複補填・7ヶ月連続Stage1検証追加
 //! - v1.2.1 (2026-11-05): 標準開発条件表として「勤務条件表_ひな形.xlsx」を採用
@@ -758,8 +759,8 @@ fn test_12_full_spec_audit_v1_2_0() {
     let cat_matched = parse_rule_target_dates("「cat」手術日", &ctx_jan, &typo_ope);
     assert_eq!(
         cat_matched,
-        vec![6, 12],
-        "タイポ 'cay' が「cat」手術日として漏れなく検出されること"
+        vec![12],
+        "タイポ 'cay' が「cat」手術日として漏れなく検出されること（'Viit,cat' は vit 扱いのため除外）"
     );
 
     // 3. 堀さん（週4日（必要に応じて週5日可））の特別枠および石橋さん（週4日固定＋土曜基本公休）の動作確認
@@ -1478,6 +1479,93 @@ fn test_15_v1_3_2_excel_datetime_single_date_and_regression() {
         res_feb.shifts["小島"][&15], 0,
         "2027年2月15日(月)が有休指定どおり休み(0)になること"
     );
+}
+
+// ============================================================================
+// 16. test_16_v1_3_3_ope_types_and_no_marked_months:
+//     手術種別4種統一（Vit,cat→vit扱い）および手術スケジュール「作成対象」列削除の検証
+// ============================================================================
+#[test]
+fn test_16_v1_3_3_ope_types_and_no_marked_months() {
+    use rust_xlsxwriter::Workbook as WxWorkbook;
+
+    // 1. 新しい標準ひな形（勤務条件表_ひな形.xlsx）の「手術スケジュール」シートに「作成対象」列が存在しないこと
+    let mut wb = open_workbook_auto("勤務条件表_ひな形.xlsx").expect("ひな形Excelを開けること");
+    let ope_range = wb
+        .worksheet_range("手術スケジュール")
+        .expect("手術スケジュールシートが存在すること");
+    let header: Vec<String> = ope_range
+        .rows()
+        .next()
+        .expect("ヘッダー行が存在すること")
+        .iter()
+        .map(|c| c.to_string().trim().to_string())
+        .collect();
+    assert!(
+        !header.iter().any(|h| h.contains("作成対象")),
+        "手術スケジュールシートから「作成対象」列が完全に削除されていること: {:?}",
+        header
+    );
+    assert_eq!(
+        header,
+        vec!["日付", "手術種別", "担当医(未参照)", "備考(未参照)"]
+    );
+
+    // 2. ひな形内の手術種別が vit / cat / gla / 下垂 の4種で読み込まれていること
+    let (parsed, holidays) = load_test_excel();
+    let allowed_kinds: HashSet<&str> = ["vit", "cat", "gla", "下垂"].into_iter().collect();
+    for (dt, kind) in &parsed.ope_dict {
+        assert!(
+            allowed_kinds.contains(kind.as_str()),
+            "ひな形の手術種別が4種のいずれかであること ({dt}: {kind})"
+        );
+    }
+
+    // 3. 「Vit,cat」と記述された旧フォーマットファイルでも "vit" として扱われ、「cat」手術日には含まれないこと
+    let tmp_xlsx = PathBuf::from("target/test_v1_3_3_vit_cat.xlsx");
+    let _ = fs::remove_file(&tmp_xlsx);
+    {
+        let mut wx = WxWorkbook::new();
+        {
+            let ws = wx.add_worksheet();
+            ws.set_name("スタッフマスタ").unwrap();
+            ws.write_string(0, 0, "氏名").unwrap();
+            ws.write_string(0, 1, "所属").unwrap();
+            ws.write_string(0, 2, "職種").unwrap();
+            ws.write_string(0, 3, "雇用形態").unwrap();
+            ws.write_string(0, 4, "基本勤務パターン").unwrap();
+            ws.write_string(1, 0, "テストA").unwrap();
+            ws.write_string(1, 1, "1階").unwrap();
+            ws.write_string(1, 2, "スタッフ").unwrap();
+            ws.write_string(1, 3, "正社員").unwrap();
+            ws.write_string(1, 4, "週5日").unwrap();
+        }
+        {
+            let ws = wx.add_worksheet();
+            ws.set_name("手術スケジュール").unwrap();
+            ws.write_string(0, 0, "日付").unwrap();
+            ws.write_string(0, 1, "手術種別").unwrap();
+            ws.write_string(1, 0, "2026-09-02").unwrap();
+            ws.write_string(1, 1, "Vit,cat").unwrap();
+            ws.write_string(2, 0, "2026-09-04").unwrap();
+            ws.write_string(2, 1, "cat").unwrap();
+        }
+        wx.save(&tmp_xlsx).unwrap();
+    }
+
+    let parsed_tmp = parse_shift_excel(&tmp_xlsx, &holidays).expect("Vit,catテストExcel読込成功");
+    let _ = fs::remove_file(&tmp_xlsx);
+
+    let d_sep2 = NaiveDate::from_ymd_opt(2026, 9, 2).unwrap();
+    let d_sep4 = NaiveDate::from_ymd_opt(2026, 9, 4).unwrap();
+    assert_eq!(parsed_tmp.ope_dict.get(&d_sep2).map(|s| s.as_str()), Some("vit"));
+    assert_eq!(parsed_tmp.ope_dict.get(&d_sep4).map(|s| s.as_str()), Some("cat"));
+
+    let ctx = MonthContext::new(2026, 9, &holidays);
+    let vit_days = parse_rule_target_dates("「Vit」手術日", &ctx, &parsed_tmp.ope_dict);
+    let cat_days = parse_rule_target_dates("「cat」手術日", &ctx, &parsed_tmp.ope_dict);
+    assert_eq!(vit_days, vec![2], "Vit,cat の 9/2 のみが Vit 手術日として扱われること");
+    assert_eq!(cat_days, vec![4], "Vit,cat の 9/2 は cat には含まれず 9/4 のみ cat 扱いになること");
 }
 
 

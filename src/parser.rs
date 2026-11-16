@@ -1,7 +1,8 @@
 //! 勤務シフト自動生成システム Excelデータ解析・日付パーサー (`parser.rs`)
 //!
-//! Version: v1.3.2
-//! Updated: 2026-11-10 - v1.3.2 Excel単体日付セル（2/15等）の対象月年解決対応（2月15日自動変換時の年不一致による反映漏れ修正）
+//! Version: v1.3.3
+//! Updated: 2026-11-17 - v1.3.3 手術種別4種整理（Vit,cat→vit扱い）および「作成対象」列・判定の廃止
+//! - v1.3.2 (2026-11-10): Excel単体日付セル（2/15等）の対象月年解決対応（2月15日自動変換時の年不一致による反映漏れ修正）
 //! - v1.3.1 (2026-11-10): 入力検証・防御的パース強化（重複スタッフ排除・和暦対応・存在しない日付[9/31等]の警告検出・未知スタッフ名警告・対象月自動補完）
 //! - v1.3.0 (2026-11-08): 「勤務形態」列・既存「職種」列からの職種(看護師/検査)判定、手術スケジュール「注射日」vs「Ope日」分離判定、PM有休(午後/半休)日付抽出対応
 //! - v1.2.0 (2026-11-01): パーサー全面堅牢化: 年跨ぎM/D自動年補完、同日複数OPE統合、前月実績年月認識、3ヶ月履歴初期化、パート希望出勤曜日補完、OR表記拡張
@@ -82,6 +83,37 @@ pub fn split_ope_tokens(ope_str: &str) -> Vec<String> {
         .collect()
 }
 
+/// 手術種別文字列を正規化する。
+/// - `vit` / `cat` / `gla` / `下垂` の4種表記へ統一（タイポ・漢字表記も吸収）
+/// - 従来表記 `Vit,cat`（`vit` と `cat` の併記）は書き方として許容しつつ `vit` として扱う
+pub fn normalize_ope_type_text(raw: &str) -> String {
+    let tokens = split_ope_tokens(raw);
+    let mut mapped: Vec<String> = Vec::new();
+    for tok in tokens {
+        let lower = tok.to_lowercase();
+        let canonical = if lower == "vit" || lower == "viit" || tok == "硝子体" {
+            "vit".to_string()
+        } else if lower == "cat" || lower == "cay" || tok == "白内障" {
+            "cat".to_string()
+        } else if lower == "gla" || tok == "緑内障" {
+            "gla".to_string()
+        } else if tok == "下垂" || tok == "眼瞼" || tok == "眼瞼下垂" {
+            "下垂".to_string()
+        } else {
+            tok
+        };
+        if !mapped.contains(&canonical) {
+            mapped.push(canonical);
+        }
+    }
+
+    if mapped.iter().any(|t| t == "vit") && mapped.iter().any(|t| t == "cat") {
+        mapped.retain(|t| t != "cat");
+    }
+
+    mapped.join(",")
+}
+
 /// 手術種別文字列に「注射」以外のオペ（Vit, cat, gla, 下垂 等）が含まれる「Ope日」か判定
 pub fn is_ope_text(ope_str: &str) -> bool {
     split_ope_tokens(ope_str)
@@ -127,7 +159,6 @@ pub struct ParsedExcelData {
     pub rules: Vec<ShiftRule>,
     pub ope_dict: HashMap<NaiveDate, String>,
     pub target_months: Vec<(i32, u32)>,
-    pub marked_months: Vec<(i32, u32)>,
     pub config: ShiftConfig,
     pub prev_month_main_offs: HashMap<String, u32>,
     /// 直近最大3ヶ月分の主公休（または週4第2公休）曜日履歴（先頭が直近1ヶ月前: `[prev_1m, prev_2m, prev_3m]`）
@@ -591,13 +622,12 @@ pub fn parse_shift_excel<P: AsRef<Path>>(
     // 2. 手術スケジュールシートの探索とパース
     let mut ope_dict = HashMap::new();
     let mut target_months_set = HashSet::new();
-    let mut marked_months_set = HashSet::new();
 
     for s_name in &sheet_names {
         let lower = s_name.to_lowercase();
         if lower.contains("手術") || lower.contains("オペ") || lower.contains("ope") {
             if let Ok(range) = workbook.worksheet_range(s_name) {
-                parse_ope_sheet(&range, &mut ope_dict, &mut target_months_set, &mut marked_months_set);
+                parse_ope_sheet(&range, &mut ope_dict, &mut target_months_set);
             }
         }
     }
@@ -605,9 +635,6 @@ pub fn parse_shift_excel<P: AsRef<Path>>(
     // 対象月リストのソート
     let mut target_months: Vec<(i32, u32)> = target_months_set.into_iter().collect();
     target_months.sort_unstable();
-
-    let mut marked_months: Vec<(i32, u32)> = marked_months_set.into_iter().collect();
-    marked_months.sort_unstable();
 
     // デフォルト年（対象月の先頭、なければ現在の年）
     let current_year = chrono::Local::now().year();
@@ -746,7 +773,6 @@ pub fn parse_shift_excel<P: AsRef<Path>>(
         rules,
         ope_dict,
         target_months,
-        marked_months,
         config,
         prev_month_main_offs,
         prev_month_main_offs_history,
@@ -779,26 +805,22 @@ fn parse_ope_sheet(
     range: &Range<Data>,
     ope_dict: &mut HashMap<NaiveDate, String>,
     target_months: &mut HashSet<(i32, u32)>,
-    marked_months: &mut HashSet<(i32, u32)>,
 ) {
     let rows: Vec<&[Data]> = range.rows().collect();
     if rows.is_empty() {
         return;
     }
 
-    // ヘッダー行探索 (日付, 種別, 作成対象)
+    // ヘッダー行探索 (日付, 種別)
     let mut col_date = None;
     let mut col_type = None;
-    let mut col_target = None;
     let mut header_row_idx = 0;
 
     for (r_idx, row) in rows.iter().enumerate().take(5) {
         for (c_idx, cell) in row.iter().enumerate() {
             let s = cell.to_string().trim().to_string();
             let s_lower = s.to_lowercase();
-            if s.contains("作成") || s.contains("対象") || s.contains("出力") || s.contains("生成") {
-                col_target = Some(c_idx);
-            } else if s.contains("種別") || s.contains("内容") || s.contains("手術") || s_lower.contains("ope") || s.contains("オペ") {
+            if s.contains("種別") || s.contains("内容") || s.contains("手術") || s_lower.contains("ope") || s.contains("オペ") {
                 col_type = Some(c_idx);
             } else if s.contains("日付") || s_lower.contains("date") {
                 col_date = Some(c_idx);
@@ -863,34 +885,18 @@ fn parse_ope_sheet(
             }
         }
 
-        let type_str = type_cell.to_string().trim().to_string();
-
-        let is_marked = if let Some(ct) = col_target {
-            if row.len() > ct {
-                let val_str = row[ct].to_string().trim().to_string();
-                val_str == "○" || val_str == "◯" || val_str == "1" || val_str.eq_ignore_ascii_case("true")
-            } else {
-                false
-            }
-        } else {
-            false
-        };
+        let type_str = normalize_ope_type_text(&type_cell.to_string());
 
         for d in parsed_vec {
             running_year = d.year();
             prev_month = Some(d.month());
             target_months.insert((d.year(), d.month()));
-            if is_marked {
-                marked_months.insert((d.year(), d.month()));
-            }
             if !type_str.is_empty() {
                 ope_dict
                     .entry(d)
                     .and_modify(|existing| {
-                        if !existing.contains(&type_str) {
-                            existing.push(',');
-                            existing.push_str(&type_str);
-                        }
+                        let combined = format!("{existing},{type_str}");
+                        *existing = normalize_ope_type_text(&combined);
                     })
                     .or_insert_with(|| type_str.clone());
             }
@@ -1702,5 +1708,16 @@ mod tests {
         let dates_nov =
             parse_date_list_for_months(&iso_nov, 2026, &target_months, Some(&holidays));
         assert!(dates_nov.contains(&NaiveDate::from_ymd_opt(2026, 11, 10).unwrap()));
+    }
+
+    #[test]
+    fn test_normalize_ope_type_vit_cat() {
+        assert_eq!(normalize_ope_type_text("Vit,cat"), "vit");
+        assert_eq!(normalize_ope_type_text("vit, cat"), "vit");
+        assert_eq!(normalize_ope_type_text("Vit"), "vit");
+        assert_eq!(normalize_ope_type_text("cat"), "cat");
+        assert_eq!(normalize_ope_type_text("gla"), "gla");
+        assert_eq!(normalize_ope_type_text("下垂"), "下垂");
+        assert_eq!(normalize_ope_type_text("Vit,cat, 注射"), "vit,注射");
     }
 }

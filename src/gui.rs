@@ -1,7 +1,8 @@
 //! 勤務シフト自動生成システム デスクトップ GUI (`gui.rs`)
 //!
-//! Version: v1.3.2
-//! Updated: 2026-11-10 - v1.3.2 外部Excel起動時の一瞬コンソール表示抑止 (CREATE_NO_WINDOW)
+//! Version: v1.3.3
+//! Updated: 2026-11-17 - v1.3.3 手術スケジュール「作成対象」列による初期選択判定を廃止（全対象月を初期選択）
+//! - v1.3.2 (2026-11-10): 外部Excel起動時の一瞬コンソール表示抑止 (CREATE_NO_WINDOW)
 //! - v1.3.1 (2026-11-10): 入力条件表の事前検証警告（日付不正・スタッフ名不一致・重複行等）のプレビュー表示対応
 //! - v1.3.0 (2026-11-08): 2階裏配置制約・石橋さん/長谷川さん個別ルール改修リリース同期
 //! - v1.2.1 (2026-11-05): 標準条件表（勤務条件表_ひな形.xlsx）の自動検出優先度整備
@@ -138,17 +139,10 @@ impl ShiftApp {
             Ok(parsed) => {
                 let mut selections = Vec::new();
                 for &(y, m) in &parsed.target_months {
-                    let is_marked = parsed.marked_months.contains(&(y, m));
-                    // marked_months が空なら全て選択、存在すれば marked のみ選択
-                    let selected = if parsed.marked_months.is_empty() {
-                        true
-                    } else {
-                        is_marked
-                    };
                     selections.push(MonthSelection {
                         year: y,
                         month: m,
-                        selected,
+                        selected: true,
                     });
                 }
                 self.month_selections = selections;

@@ -1,7 +1,8 @@
 //! 勤務条件表 ひな形ファイル生成ツール (`examples/generate_template.rs`)
 //!
-//! Version: v1.3.0
-//! Updated: 2026-11-08 - v1.3.0 2階裏職種判定（看護師/検査）・注射日対応・石橋さん週4固定＆Ope除外・土曜PM有休表記ガイド追加
+//! Version: v1.3.3
+//! Updated: 2026-11-17 - v1.3.3 手術種別4種統一（vit/cat/gla/下垂、Vit,cat→vit変換対応）および手術スケジュール「作成対象」列の完全削除
+//! - v1.3.0 (2026-11-08): 2階裏職種判定（看護師/検査）・注射日対応・石橋さん週4固定＆Ope除外・土曜PM有休表記ガイド追加
 //! - v1.2.1 (2026-11-05): 標準開発・配布同梱用「勤務条件表_ひな形.xlsx」生成ツール（システム参照の有効・補助・未参照の視覚的区分、入力規則プルダウン、セルコメント、記入ガイドシート完備）
 //!
 //! 実行方法:
@@ -12,7 +13,7 @@ use rust_xlsxwriter::{
     Workbook, Worksheet, XlsxError,
 };
 
-const TEMPLATE_VERSION: &str = "v1.3.0";
+const TEMPLATE_VERSION: &str = "v1.3.3";
 
 fn main() -> Result<(), XlsxError> {
     let out_path = "勤務条件表_ひな形.xlsx";
@@ -564,7 +565,6 @@ fn build_ope_sheet(ws: &mut Worksheet) -> Result<(), XlsxError> {
     ws.set_row_height(0, 32.0)?;
 
     let h_act = fmt_header_active();
-    let h_cond = fmt_header_cond();
     let h_ign = fmt_header_ignored();
 
     let headers: &[(&str, &Format, f64, &str)] = &[
@@ -578,13 +578,7 @@ fn build_ope_sheet(ws: &mut Worksheet) -> Result<(), XlsxError> {
             "手術種別",
             &h_act,
             18.0,
-            "【有効】\nVit / cat / gla / 下垂 / 注射 などを記入（カンマ区切り複数可。同一日の複数行も自動結合）。\n・「注射」以外のオペがある日＝「Ope日」（石橋さん必須＆2階裏外来カウント除外、2階裏外来3名以上必須）\n・「注射」がある日＝「注射日」（石橋さん必須出勤）",
-        ),
-        (
-            "作成対象",
-            &h_cond,
-            12.0,
-            "【補助参照（GUI初期選択用）】\n・全行空欄の場合: 登場するすべての年月を生成対象として初期選択します。\n・特定の月の行に「○」を付けた場合: GUI起動時に「○」が付いた月だけチェックONの状態にします。",
+            "【有効】\n「vit」「cat」「gla」「下垂」の4種から選択・記入してください。\n※従来表記の「Vit,cat」も書き方としては許容されますが、システム内では「vit」として扱われます。",
         ),
         (
             "担当医(未参照)",
@@ -608,51 +602,50 @@ fn build_ope_sheet(ws: &mut Worksheet) -> Result<(), XlsxError> {
     }
 
     let opes: &[(&str, &str, &str)] = &[
-        ("2026-09-02", "Vit,cat", "重城"),
+        ("2026-09-02", "vit", "重城"),
         ("2026-09-04", "cat", "恩田"),
         ("2026-09-08", "cat", "恩田"),
         ("2026-09-11", "cat", "恩田"),
         ("2026-09-13", "gla", "相原"),
         ("2026-09-16", "下垂", "宮田"),
-        ("2026-09-25", "Vit,cat", "真下"),
+        ("2026-09-25", "vit", "真下"),
         ("2026-10-04", "gla", "相原"),
         ("2026-10-09", "cat", "恩田"),
-        ("2026-10-14", "Vit,cat", "重城"),
+        ("2026-10-14", "vit", "重城"),
         ("2026-10-16", "cat", "恩田"),
-        ("2026-10-23", "Vit,cat", "真下"),
+        ("2026-10-23", "vit", "真下"),
         ("2026-10-27", "cat", "恩田"),
-        ("2026-11-04", "Vit,cat", "重城"),
+        ("2026-11-04", "vit", "重城"),
         ("2026-11-06", "cat", "恩田"),
         ("2026-11-13", "cat", "恩田"),
         ("2026-11-18", "cat", "恩田"),
         ("2026-11-20", "cat", "恩田"),
-        ("2026-12-02", "Vit,cat", "重城"),
+        ("2026-12-02", "vit", "重城"),
         ("2026-12-04", "cat", "恩田"),
         ("2026-12-11", "cat", "恩田"),
-        ("2026-12-15", "Vit,cat", "真下"),
+        ("2026-12-15", "vit", "真下"),
         ("2026-12-18", "cat", "恩田"),
-        ("2027-01-06", "Vit,cat", "重城"),
+        ("2027-01-06", "vit", "重城"),
         ("2027-01-08", "cat", "恩田"),
         ("2027-01-13", "下垂", "宮田"),
         ("2027-01-15", "cat", "恩田"),
         ("2027-01-26", "cat", "恩田"),
-        ("2027-01-29", "Vit,cat", "真下"),
+        ("2027-01-29", "vit", "真下"),
         ("2027-01-31", "gla", "相原"),
-        ("2027-02-03", "Vit,cat", "重城"),
+        ("2027-02-03", "vit", "重城"),
         ("2027-02-05", "cat", "恩田"),
         ("2027-02-12", "cat", "恩田"),
         ("2027-02-19", "cat", "恩田"),
         ("2027-02-21", "gla", "相原"),
-        ("2027-02-26", "Vit,cat", "真下"),
+        ("2027-02-26", "vit", "真下"),
         ("2027-03-05", "cat", "恩田"),
         ("2027-03-07", "gla", "相原"),
         ("2027-03-09", "cat", "恩田"),
-        ("2027-03-12", "Vit,cat", "真下"),
+        ("2027-03-12", "vit", "真下"),
         ("2027-03-26", "cat", "恩田"),
     ];
 
     let f_act_c = fmt_cell_active(true);
-    let f_cond_c = fmt_cell_cond(true);
     let f_ign_c = fmt_cell_ignored(true);
     let f_ign_l = fmt_cell_ignored(false);
 
@@ -661,15 +654,14 @@ fn build_ope_sheet(ws: &mut Worksheet) -> Result<(), XlsxError> {
         ws.set_row_height(row_num, 20.0)?;
         ws.write_string_with_format(row_num, 0, dt, &f_act_c)?;
         ws.write_string_with_format(row_num, 1, kind, &f_act_c)?;
-        ws.write_blank(row_num, 2, &f_cond_c)?;
-        ws.write_string_with_format(row_num, 3, doc, &f_ign_c)?;
-        ws.write_blank(row_num, 4, &f_ign_l)?;
+        ws.write_string_with_format(row_num, 2, doc, &f_ign_c)?;
+        ws.write_blank(row_num, 3, &f_ign_l)?;
     }
 
-    let dv_mark = DataValidation::new()
-        .allow_list_strings(&["○"])?
+    let dv_ope_type = DataValidation::new()
+        .allow_list_strings(&["vit", "cat", "gla", "下垂"])?
         .set_error_style(DataValidationErrorStyle::Information);
-    ws.add_data_validation(1, 2, 100, 2, &dv_mark)?;
+    ws.add_data_validation(1, 1, 100, 1, &dv_ope_type)?;
 
     Ok(())
 }
@@ -936,7 +928,7 @@ fn build_guide_sheet(ws: &mut Worksheet) -> Result<(), XlsxError> {
     ws.write_string_with_format(
         0,
         0,
-        format!("勤務条件表 ひな形 記入ガイド（ひな形 Version: {} / 対応アプリ: v1.3.0以降）", TEMPLATE_VERSION),
+        format!("勤務条件表 ひな形 記入ガイド（ひな形 Version: {} / 対応アプリ: v1.3.3以降）", TEMPLATE_VERSION),
         &fmt_title,
     )?;
 
@@ -952,7 +944,7 @@ fn build_guide_sheet(ws: &mut Worksheet) -> Result<(), XlsxError> {
     ws.set_row_height(4, 26.0)?;
     ws.write_string_with_format(4, 0, "青緑ヘッダー（薄水色背景）", &h_cond)?;
     ws.write_string_with_format(4, 1, "【条件付き・補助参照】", &f_cell)?;
-    ws.write_string_with_format(4, 2, "特定条件（パートの公休空欄時、GUI初期選択など）でのみ参照される項目です。", &f_cell)?;
+    ws.write_string_with_format(4, 2, "特定条件（パートの公休空欄時など）でのみ参照される項目です。", &f_cell)?;
     ws.write_string_with_format(4, 3, "正社員の「希望出勤曜日」などはここに入れても無視されます。", &f_cell)?;
 
     ws.set_row_height(5, 26.0)?;
