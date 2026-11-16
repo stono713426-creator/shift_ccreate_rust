@@ -1,8 +1,8 @@
 # 勤務シフト自動生成システム (Rust Edition)
 
-> Version: v1.3.3  
+> Version: v1.3.4  
 > Release Date: 2026-11-17  
-> Status: v1.3.3 Released & Verified 🎉
+> Status: v1.3.4 Released & Verified 🎉
 
 医療機関等の複雑な勤務シフト制約を、オープンソース最高峰の数理最適化ソルバー（MILP: HiGHS）によって高速解決し、現場フォーマットの Excel 帳票として出力する **純Rust製ネイティブ・デスクトップアプリケーション** です（Python版 `sift_create` v1.9.1 の全仕様完全移植プロジェクト）。
 
@@ -98,7 +98,7 @@ cargo run --example generate_template
 # 全 31 件のテスト実行 (ユニット 15 件 + 統合回帰 16 件)
 cargo test
 
-# 配布用リリースビルド (ファイルバージョン v1.3.3 埋め込み)
+# 配布用リリースビルド (ファイルバージョン v1.3.4 埋め込み)
 cargo build --release
 ```
 
@@ -108,9 +108,9 @@ cargo build --release
 
 ビルド済みの配布用パッケージは `dist/` ディレクトリに生成されます：
 
-- **ZIP アーカイブ**: `dist/shift_create_rust_v1.3.3_windows_x64.zip`
+- **ZIP アーカイブ**: `dist/shift_create_rust_v1.3.4_windows_x64.zip`
 - **内容物**:
-  - `shift_create_rust.exe` (ネイティブ実行ファイル本体、バージョンリソース `v1.3.3` 埋め込み済み・GUIコンソール非表示対応)
+  - `shift_create_rust.exe` (ネイティブ実行ファイル本体、バージョンリソース `v1.3.4` 埋め込み済み・GUIコンソール非表示対応)
   - `勤務条件表_ひな形.xlsx` (標準勤務条件表ひな形：参照区分カラー・入力規則・記入ガイド付き、手術種別4種統一＆「作成対象」列廃止)
   - `libstdc++-6.dll`, `libgcc_s_seh-1.dll`, `libwinpthread-1.dll` (ランタイム同梱)
   - `README.txt` (配布用マニュアル)

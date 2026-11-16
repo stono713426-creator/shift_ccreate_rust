@@ -1,7 +1,8 @@
 //! 勤務シフト自動生成システム 二段階数理最適化ソルバー (`solver.rs`)
 //!
-//! Version: v1.3.3
-//! Updated: 2026-11-17 - v1.3.3 手術種別「Vit,cat」を「vit」として扱う術式判定の統一
+//! Version: v1.3.4
+//! Updated: 2026-11-17 - v1.3.4 「vit」（および「Vit,cat」）の勤務シフト条件上での「cat」同一条件扱い対応
+//! - v1.3.3 (2026-11-17): 手術種別「Vit,cat」を「vit」として扱う術式判定の統一
 //! - v1.3.1 (2026-11-10): ソルバー競合・破綻防止強化（Stage 2 所定日数防衛重み25M化、連勤上限の月跨ぎ整合＆Stage 2緊急スラック化、特別枠[堀さん]Stage 2スラック＆target上限クランプ、2階裏およびHARDルールの週次/月次供給量Pigeonholeガード追加）
 //! - v1.3.0 (2026-11-08): 2階裏人数・職種バランス強化（Ope日3人以上[Ns1/検査2]＆2+2推奨、火曜[Ns2/検査1]・木曜[Ns1/検査2]・土曜3人以上[PM休例外]）、石橋さん個別ルール（祝日非連動の週4固定・Ope/注射必須・条件付水曜公休・Ope日外来除外）、長谷川さん・石橋さん重複最小化＆フルタイム+1増員対応
 //! - v1.2.0 (2026-11-01): 全仕様監査対応: 週4×固定1日特別枠対応、2階裏基本人数・ブレ幅・二乗ペナルティ実装、3ヶ月ローテーション履歴、7日ローリング窓・月末公休抑制、3連休有休除外、OPEタイポ吸収、タイムリミット適用
@@ -809,7 +810,13 @@ pub fn parse_rule_target_dates(
                 let matched = if kw_lower == "vit" || kw_lower == "viit" || kw == "硝子体" {
                     ope_lower.contains("vit") || ope_lower.contains("viit") || norm_ope.contains("硝子体")
                 } else if kw_lower == "cat" || kw_lower == "cay" || kw == "白内障" {
-                    ope_lower.contains("cat") || ope_lower.contains("cay") || norm_ope.contains("白内障")
+                    // 「vit」（および旧「Vit,cat」）は名称として独立しているが、勤務シフト条件上は「cat」と同じ条件で扱う
+                    ope_lower.contains("cat")
+                        || ope_lower.contains("cay")
+                        || norm_ope.contains("白内障")
+                        || ope_lower.contains("vit")
+                        || ope_lower.contains("viit")
+                        || norm_ope.contains("硝子体")
                 } else if kw_lower == "gla" || kw == "緑内障" {
                     ope_lower.contains("gla") || norm_ope.contains("緑内障")
                 } else if kw == "下垂" || kw == "眼瞼" || kw == "眼瞼下垂" {

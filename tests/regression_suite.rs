@@ -1,7 +1,8 @@
 //! 勤務シフト自動生成システム 統合回帰テストスイート (`tests/regression_suite.rs`)
 //!
-//! Version: v1.3.3
-//! Updated: 2026-11-17 - v1.3.3 test_16 手術種別4種統一（Vit,cat→vit扱い）＆新ひな形「作成対象」列廃止検証追加
+//! Version: v1.3.4
+//! Updated: 2026-11-17 - v1.3.4 vit（およびVit,cat）がシフト条件上でcatと同一扱いになることの検証追加
+//! - v1.3.3 (2026-11-17): test_16 手術種別4種統一（Vit,cat→vit扱い）＆新ひな形「作成対象」列廃止検証追加
 //! - v1.3.2 (2026-11-10): test_15 Excel単体日付セル（2/15→2026-02-15シリアル値）の翌年補完＆2027年2月ソルブ反映検証追加
 //! - v1.3.1 (2026-11-10): test_14 連勤上限・希望休超過・Ope集中週・HARDペア全休時のソルバー破綻＆重み逆転防止検証追加
 //! - v1.3.0 (2026-11-08): test_13 2階裏職種判定・Ope日/注射日・石橋さん週4固定＆条件付水曜公休＆Ope外来除外・曜日別職種人数・土曜PM有休例外・早上がり重複補填・7ヶ月連続Stage1検証追加
@@ -759,8 +760,8 @@ fn test_12_full_spec_audit_v1_2_0() {
     let cat_matched = parse_rule_target_dates("「cat」手術日", &ctx_jan, &typo_ope);
     assert_eq!(
         cat_matched,
-        vec![12],
-        "タイポ 'cay' が「cat」手術日として漏れなく検出されること（'Viit,cat' は vit 扱いのため除外）"
+        vec![6, 12],
+        "タイポ 'cay' および 'Viit,cat' が「cat」手術日として漏れなく検出されること"
     );
 
     // 3. 堀さん（週4日（必要に応じて週5日可））の特別枠および石橋さん（週4日固定＋土曜基本公休）の動作確認
@@ -1549,6 +1550,8 @@ fn test_16_v1_3_3_ope_types_and_no_marked_months() {
             ws.write_string(1, 1, "Vit,cat").unwrap();
             ws.write_string(2, 0, "2026-09-04").unwrap();
             ws.write_string(2, 1, "cat").unwrap();
+            ws.write_string(3, 0, "2026-09-09").unwrap();
+            ws.write_string(3, 1, "vit").unwrap();
         }
         wx.save(&tmp_xlsx).unwrap();
     }
@@ -1558,14 +1561,20 @@ fn test_16_v1_3_3_ope_types_and_no_marked_months() {
 
     let d_sep2 = NaiveDate::from_ymd_opt(2026, 9, 2).unwrap();
     let d_sep4 = NaiveDate::from_ymd_opt(2026, 9, 4).unwrap();
+    let d_sep9 = NaiveDate::from_ymd_opt(2026, 9, 9).unwrap();
     assert_eq!(parsed_tmp.ope_dict.get(&d_sep2).map(|s| s.as_str()), Some("vit"));
     assert_eq!(parsed_tmp.ope_dict.get(&d_sep4).map(|s| s.as_str()), Some("cat"));
+    assert_eq!(parsed_tmp.ope_dict.get(&d_sep9).map(|s| s.as_str()), Some("vit"));
 
     let ctx = MonthContext::new(2026, 9, &holidays);
     let vit_days = parse_rule_target_dates("「Vit」手術日", &ctx, &parsed_tmp.ope_dict);
     let cat_days = parse_rule_target_dates("「cat」手術日", &ctx, &parsed_tmp.ope_dict);
-    assert_eq!(vit_days, vec![2], "Vit,cat の 9/2 のみが Vit 手術日として扱われること");
-    assert_eq!(cat_days, vec![4], "Vit,cat の 9/2 は cat には含まれず 9/4 のみ cat 扱いになること");
+    assert_eq!(vit_days, vec![2, 9], "vit および Vit,cat の日が Vit 手術日として扱われること");
+    assert_eq!(
+        cat_days,
+        vec![2, 4, 9],
+        "勤務シフト条件上は vit / Vit,cat も cat と同じ条件として扱われること"
+    );
 }
 
 

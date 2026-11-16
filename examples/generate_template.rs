@@ -1,7 +1,8 @@
 //! 勤務条件表 ひな形ファイル生成ツール (`examples/generate_template.rs`)
 //!
-//! Version: v1.3.3
-//! Updated: 2026-11-17 - v1.3.3 手術種別4種統一（vit/cat/gla/下垂、Vit,cat→vit変換対応）および手術スケジュール「作成対象」列の完全削除
+//! Version: v1.3.4
+//! Updated: 2026-11-17 - v1.3.4 vitのシフト条件上cat同一扱い明記
+//! - v1.3.3 (2026-11-17): 手術種別4種統一（vit/cat/gla/下垂、Vit,cat→vit変換対応）および手術スケジュール「作成対象」列の完全削除
 //! - v1.3.0 (2026-11-08): 2階裏職種判定（看護師/検査）・注射日対応・石橋さん週4固定＆Ope除外・土曜PM有休表記ガイド追加
 //! - v1.2.1 (2026-11-05): 標準開発・配布同梱用「勤務条件表_ひな形.xlsx」生成ツール（システム参照の有効・補助・未参照の視覚的区分、入力規則プルダウン、セルコメント、記入ガイドシート完備）
 //!
@@ -13,7 +14,7 @@ use rust_xlsxwriter::{
     Workbook, Worksheet, XlsxError,
 };
 
-const TEMPLATE_VERSION: &str = "v1.3.3";
+const TEMPLATE_VERSION: &str = "v1.3.4";
 
 fn main() -> Result<(), XlsxError> {
     let out_path = "勤務条件表_ひな形.xlsx";
@@ -578,7 +579,7 @@ fn build_ope_sheet(ws: &mut Worksheet) -> Result<(), XlsxError> {
             "手術種別",
             &h_act,
             18.0,
-            "【有効】\n「vit」「cat」「gla」「下垂」の4種から選択・記入してください。\n※従来表記の「Vit,cat」も書き方としては許容されますが、システム内では「vit」として扱われます。",
+            "【有効】\n「vit」「cat」「gla」「下垂」の4種から選択・記入してください。\n※「vit」（および従来表記の「Vit,cat」）は名称として独立していますが、勤務シフト条件上は「cat」と同じ条件で扱われます。",
         ),
         (
             "担当医(未参照)",
