@@ -1,7 +1,8 @@
 //! 勤務シフト自動生成システム 二段階数理最適化ソルバー (`solver.rs`)
 //!
-//! Version: v1.3.4
-//! Updated: 2026-11-17 - v1.3.4 「vit」（および「Vit,cat」）の勤務シフト条件上での「cat」同一条件扱い対応
+//! Version: v1.3.5
+//! Updated: 2026-11-17 - v1.3.5 2階裏の日次最低出勤人数（有休1名まで減算なし・2名以上減算）、特別枠（堀さん）の週4基準維持・非常時のみ週5化、職種別隠れ必須人数の事前診断反映
+//! - v1.3.4 (2026-11-17): 「vit」（および「Vit,cat」）の勤務シフト条件上での「cat」同一条件扱い対応
 //! - v1.3.3 (2026-11-17): 手術種別「Vit,cat」を「vit」として扱う術式判定の統一
 //! - v1.3.1 (2026-11-10): ソルバー競合・破綻防止強化（Stage 2 所定日数防衛重み25M化、連勤上限の月跨ぎ整合＆Stage 2緊急スラック化、特別枠[堀さん]Stage 2スラック＆target上限クランプ、2階裏およびHARDルールの週次/月次供給量Pigeonholeガード追加）
 //! - v1.3.0 (2026-11-08): 2階裏人数・職種バランス強化（Ope日3人以上[Ns1/検査2]＆2+2推奨、火曜[Ns2/検査1]・木曜[Ns1/検査2]・土曜3人以上[PM休例外]）、石橋さん個別ルール（祝日非連動の週4固定・Ope/注射必須・条件付水曜公休・Ope日外来除外）、長谷川さん・石橋さん重複最小化＆フルタイム+1増員対応
@@ -1108,8 +1109,26 @@ fn build_and_solve_stage(
                             .iter()
                             .filter(|s| is_other_2f_b_avail(s) && s.is_core)
                             .count();
+                        // 有休1名までは減算せず3名維持、有休2名以上の日は(人数-1)分を減算する構造に合わせ、
+                        // 石橋さんを水曜公休にしても他スタッフだけで当日の要求人数以上を確保できる場合のみ強制公休化
+                        let vac_other_2f_b_wed = data
+                            .staffs
+                            .iter()
+                            .filter(|s| {
+                                s.section == "2階裏"
+                                    && s.name != "石橋"
+                                    && s.is_core
+                                    && s.pattern != "除外"
+                                    && (s.vacation_dates.contains(&wed_date)
+                                        || s.special_vacation_dates.contains(&wed_date)
+                                        || s.preferred_off_dates.contains(&wed_date)
+                                        || (config.specified_off_rule
+                                            && s.specified_off_dates.contains(&wed_date)))
+                            })
+                            .count() as i32;
+                        let wed_vac_deduct = (vac_other_2f_b_wed - 1).max(0);
                         let min_other_needed =
-                            (config.sec_2f_back_base_cap as usize).saturating_sub(1);
+                            (config.sec_2f_back_base_cap - wed_vac_deduct).max(0) as usize;
 
                         if stage == 1
                             && other_avail_nurses > 0
@@ -1220,24 +1239,22 @@ fn build_and_solve_stage(
                     }
                 }
 
-                // 通常週4スタッフ（特別枠でない場合）は、指定公休を含まない各ISO週において原則として第2公休曜日は休み
-                if !staff.is_special {
-                    for week in &ctx.weeks {
-                        let week_has_spec_off = config.specified_off_rule
-                            && week
-                                .days
-                                .iter()
-                                .any(|&d| staff.specified_off_dates.contains(&ctx.date_map[&d]));
-                        if !week_has_spec_off {
-                            for &d in &week.clinic_days {
-                                let w = ctx.weekday_map[&d];
-                                if candidates.contains(&w) {
-                                    let slide_slack = vars.add(variable().min(0.0));
-                                    constraints.push(constraint!(
-                                        x_vars[&(s_name.clone(), d)] + y_vars[&(s_name.clone(), w)] - slide_slack <= 1.0
-                                    ));
-                                    objective += slide_slack * WEIGHT_SECOND_OFF_SLIDE_SLACK as f64;
-                                }
+                // 各ISO週において、指定公休を含まない週なら原則として第2公休曜日は休み
+                for week in &ctx.weeks {
+                    let week_has_spec_off = config.specified_off_rule
+                        && week
+                            .days
+                            .iter()
+                            .any(|&d| staff.specified_off_dates.contains(&ctx.date_map[&d]));
+                    if !week_has_spec_off {
+                        for &d in &week.clinic_days {
+                            let w = ctx.weekday_map[&d];
+                            if candidates.contains(&w) {
+                                let slide_slack = vars.add(variable().min(0.0));
+                                constraints.push(constraint!(
+                                    x_vars[&(s_name.clone(), d)] + y_vars[&(s_name.clone(), w)] - slide_slack <= 1.0
+                                ));
+                                objective += slide_slack * WEIGHT_SECOND_OFF_SLIDE_SLACK as f64;
                             }
                         }
                     }
@@ -1330,23 +1347,21 @@ fn build_and_solve_stage(
                 }
 
                 // 各 ISO 週において、指定公休を含まない週なら原則として主公休曜日は休み
-                if !staff.is_special {
-                    for week in &ctx.weeks {
-                        let week_has_spec_off = config.specified_off_rule
-                            && week
-                                .days
-                                .iter()
-                                .any(|&d| staff.specified_off_dates.contains(&ctx.date_map[&d]));
-                        if !week_has_spec_off {
-                            for &d in &week.clinic_days {
-                                let w = ctx.weekday_map[&d];
-                                if candidates.contains(&w) {
-                                    let slide_slack = vars.add(variable().min(0.0));
-                                    constraints.push(constraint!(
-                                        x_vars[&(s_name.clone(), d)] + y_vars[&(s_name.clone(), w)] - slide_slack <= 1.0
-                                    ));
-                                    objective += slide_slack * WEIGHT_MAIN_OFF_SLIDE_SLACK as f64;
-                                }
+                for week in &ctx.weeks {
+                    let week_has_spec_off = config.specified_off_rule
+                        && week
+                            .days
+                            .iter()
+                            .any(|&d| staff.specified_off_dates.contains(&ctx.date_map[&d]));
+                    if !week_has_spec_off {
+                        for &d in &week.clinic_days {
+                            let w = ctx.weekday_map[&d];
+                            if candidates.contains(&w) {
+                                let slide_slack = vars.add(variable().min(0.0));
+                                constraints.push(constraint!(
+                                    x_vars[&(s_name.clone(), d)] + y_vars[&(s_name.clone(), w)] - slide_slack <= 1.0
+                                ));
+                                objective += slide_slack * WEIGHT_MAIN_OFF_SLIDE_SLACK as f64;
                             }
                         }
                     }
@@ -1529,7 +1544,7 @@ fn build_and_solve_stage(
                         .map(|&d| x_vars[&(s_name.clone(), d)])
                         .sum();
 
-                    let target_c_off = if staff.pattern.contains("週4") && !staff.is_special {
+                    let target_c_off = if staff.pattern.contains("週4") {
                         let fri_sat_cnt = active_c_days
                             .iter()
                             .filter(|&&d| matches!(ctx.weekday_map[&d], 4 | 5))
@@ -1559,7 +1574,7 @@ fn build_and_solve_stage(
 
                 // 7b. 7暦日ローリングウィンドウ平準化 (WEIGHT_ROLLING_WINDOW_DIFF)
                 if ctx.days_in_month >= 7 {
-                    let rolling_target_off = if staff.pattern.contains("週4") && !staff.is_special {
+                    let rolling_target_off = if staff.pattern.contains("週4") {
                         (config.weekly_off_target + 1) as f64
                     } else {
                         config.weekly_off_target as f64
@@ -2033,6 +2048,10 @@ fn build_and_solve_stage(
                         || (config.specified_off_rule && s.specified_off_dates.contains(&date))
                 })
                 .count() as i32;
+            // v1.3.4t 仕様: 有休・指定公休・希望休が1名までは減算せず3名維持、2名以上の日は(人数-1)分を減算
+            let vac_deduct = (vac_2f_b_on_d - 1).max(0);
+            let non_ope_base_min =
+                (3.max(config.sec_2f_back_base_cap) - vac_deduct).max(0);
 
             let (mut req_total_min, mut req_nurse_min, mut req_exam_min) = if is_ope {
                 (
@@ -2042,7 +2061,7 @@ fn build_and_solve_stage(
                 )
             } else {
                 (
-                    (config.sec_2f_back_base_cap - vac_2f_b_on_d).max(0),
+                    (config.sec_2f_back_base_cap - vac_deduct).max(0),
                     config.nurse_min_count.max(0),
                     0,
                 )
@@ -2052,29 +2071,50 @@ fn build_and_solve_stage(
                 1 => {
                     req_nurse_min = req_nurse_min.max(2);
                     req_exam_min = req_exam_min.max(1);
-                    req_total_min = req_total_min.max(3.max(config.sec_2f_back_base_cap));
+                    if is_ope {
+                        req_total_min = req_total_min.max(3.max(config.sec_2f_back_base_cap));
+                    } else {
+                        req_total_min = req_total_min.max(non_ope_base_min);
+                    }
                 }
                 3 => {
                     req_nurse_min = req_nurse_min.max(1);
                     req_exam_min = req_exam_min.max(2);
-                    req_total_min = req_total_min.max(3.max(config.sec_2f_back_base_cap));
+                    if is_ope {
+                        req_total_min = req_total_min.max(3.max(config.sec_2f_back_base_cap));
+                    } else {
+                        req_total_min = req_total_min.max(non_ope_base_min);
+                    }
                 }
                 5 => {
                     let has_pm_leave_2f_b = core_2f_back
                         .iter()
                         .any(|s| s.pm_leave_dates.contains(&date));
                     if has_pm_leave_2f_b && !is_ope {
-                        req_total_min = 2;
-                    } else {
+                        req_total_min = 2.min(non_ope_base_min.max(2));
+                    } else if is_ope {
                         req_total_min = req_total_min.max(3.max(config.sec_2f_back_base_cap));
+                    } else {
+                        req_total_min = req_total_min.max(non_ope_base_min);
                     }
                 }
                 _ => {}
             }
 
-            let eff_total = req_total_min.min(avail_total_names.len() as i32);
-            let eff_nurse = req_nurse_min.min(avail_nurse_names.len() as i32);
-            let eff_exam = req_exam_min.min(avail_exam_names.len() as i32);
+            // 1. 職種別の物理上限および総人数から逆算される隠れ必須人数（他職種の欠員による押し上げ）を事前診断に反映
+            let eff_nurse_base = req_nurse_min.min(avail_nurse_names.len() as i32);
+            let eff_exam_base = req_exam_min.min(avail_exam_names.len() as i32);
+            let eff_total = req_total_min
+                .max(eff_nurse_base + eff_exam_base)
+                .min(avail_total_names.len() as i32);
+            let implied_nurse_min = (eff_total - avail_exam_names.len() as i32).max(0);
+            let implied_exam_min = (eff_total - avail_nurse_names.len() as i32).max(0);
+            let eff_nurse = eff_nurse_base
+                .max(implied_nurse_min)
+                .min(avail_nurse_names.len() as i32);
+            let eff_exam = eff_exam_base
+                .max(implied_exam_min)
+                .min(avail_exam_names.len() as i32);
 
             day_reqs_2f_total.insert(d, (eff_total, avail_total_names));
             day_reqs_2f_nurse.insert(d, (eff_nurse, avail_nurse_names));
@@ -2090,8 +2130,11 @@ fn build_and_solve_stage(
         &day_reqs_2f_nurse,
         &mut forced_work_days,
     );
-    let hard_weeks_2f_total =
+    let mut hard_weeks_2f_total =
         evaluate_group_hard_weeks(&core_2f_back, true, &day_reqs_2f_total, &mut forced_work_days);
+    // 職種別（看護師・検査）のいずれかで供給上限を超過する週は、総人数ハード制約による間接的なStage 1破綻を防ぐため総人数もスラックモードへ同期
+    hard_weeks_2f_total
+        .retain(|w| hard_weeks_2f_nurse.contains(w) && hard_weeks_2f_exam.contains(w));
 
     if stage == 1 && num_core_2f_b > 0 {
         let total_weeks = ctx.weeks.len();
@@ -2464,9 +2507,18 @@ fn build_and_solve_stage(
                 .iter()
                 .filter(|&&d| is_ope_date(&data.ope_dict, &ctx.date_map[&d]))
                 .count();
-            let week_out_supply: i32 = core_2f_back
+            // 堀さん（特別枠：週4基準）を週5化させずに達成できる場合のみ週4名体制を確保するため、
+            // 週4スタッフの通常上限を週4日として供給量を算出し、かつ WEIGHT_2F_BACK_WEEKLY_4_SLACK (5M < 特別枠超過 10M) のスラック制約として適用
+            let week_out_supply_normal: i32 = core_2f_back
                 .iter()
-                .map(|&s| staff_week_cap(s, week.week_index, true))
+                .map(|&s| {
+                    let raw_cap = staff_week_cap(s, week.week_index, true);
+                    if s.pattern.contains("週4") && s.name != "石橋" {
+                        raw_cap.min(4)
+                    } else {
+                        raw_cap
+                    }
+                })
                 .sum();
             let min_needed_for_4plus = 18 + config.sec_2f_back_weekly_4_min;
 
@@ -2487,18 +2539,10 @@ fn build_and_solve_stage(
             }
 
             let min_4days = config.sec_2f_back_weekly_4_min as f64;
-            if stage == 1
-                && vac_person_days_in_week <= 1
-                && ope_days_in_week <= 2
-                && week_out_supply >= min_needed_for_4plus
-                && hard_weeks_2f_total.contains(&week.week_index)
-            {
-                constraints.push(constraint!(is_4plus_sum >= min_4days));
-            } else {
-                let slack_4 = vars.add(variable().min(0.0));
-                constraints.push(constraint!(is_4plus_sum + slack_4 >= min_4days));
-                objective += slack_4 * WEIGHT_2F_BACK_WEEKLY_4_SLACK as f64;
-            }
+            let _ = (vac_person_days_in_week, ope_days_in_week, week_out_supply_normal, min_needed_for_4plus);
+            let slack_4 = vars.add(variable().min(0.0));
+            constraints.push(constraint!(is_4plus_sum + slack_4 >= min_4days));
+            objective += slack_4 * WEIGHT_2F_BACK_WEEKLY_4_SLACK as f64;
         }
     }
 

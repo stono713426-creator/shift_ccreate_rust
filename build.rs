@@ -1,7 +1,8 @@
 //! Windows 実行ファイル (.exe) へのバージョン情報リソース自動埋め込みスクリプト
 //!
-//! Version: v1.3.2
-//! Updated: 2026-11-10 - v1.3.2 リリースバージョン同期
+//! Version: v1.3.5
+//! Updated: 2026-11-17 - v1.3.5 リリースバージョン同期
+//! - v1.3.2 (2026-11-10): リリースバージョン同期
 //! - v1.3.0 (2026-11-08): リリースバージョン同期
 //! - v1.2.1 (2026-11-05): windres プリプロセッサに LLVM clang.exe フォールバックを追加（Windows Smart App Control 対応）
 //! - v1.0.0 (2026-10-31): Cargo.toml の version から自動的に FileVersion / ProductVersion を埋め込む初期構築
@@ -20,14 +21,19 @@ fn main() {
     }
 
     let pkg_version = env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "1.0.0".to_string());
-    let parts: Vec<u16> = pkg_version
+    let base_ver = pkg_version.split(['-', '+']).next().unwrap_or("1.0.0");
+    let parts: Vec<u16> = base_ver
         .split('.')
         .map(|s| s.parse::<u16>().unwrap_or(0))
         .collect();
     let major = *parts.first().unwrap_or(&1);
     let minor = *parts.get(1).unwrap_or(&0);
     let patch = *parts.get(2).unwrap_or(&0);
-    let ver_str = format!("v{major}.{minor}.{patch}");
+    let ver_str = if let Some((_, pre)) = pkg_version.split_once('-') {
+        format!("v{major}.{minor}.{patch}{pre}")
+    } else {
+        format!("v{major}.{minor}.{patch}")
+    };
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
     let rc_path = out_dir.join("version_auto.rc");

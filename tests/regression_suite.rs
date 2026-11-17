@@ -1,7 +1,8 @@
 //! 勤務シフト自動生成システム 統合回帰テストスイート (`tests/regression_suite.rs`)
 //!
-//! Version: v1.3.4
-//! Updated: 2026-11-17 - v1.3.4 vit（およびVit,cat）がシフト条件上でcatと同一扱いになることの検証追加
+//! Version: v1.3.5
+//! Updated: 2026-11-17 - v1.3.5 2階裏の日次最低出勤人数（有休1名まで減算なし・2名以上減算）、堀さん週4基準維持・非常時のみ週5化、職種別隠れ必須人数の事前診断検証追加
+//! - v1.3.4 (2026-11-17): vit（およびVit,cat）がシフト条件上でcatと同一扱いになることの検証追加
 //! - v1.3.3 (2026-11-17): test_16 手術種別4種統一（Vit,cat→vit扱い）＆新ひな形「作成対象」列廃止検証追加
 //! - v1.3.2 (2026-11-10): test_15 Excel単体日付セル（2/15→2026-02-15シリアル値）の翌年補完＆2027年2月ソルブ反映検証追加
 //! - v1.3.1 (2026-11-10): test_14 連勤上限・希望休超過・Ope集中週・HARDペア全休時のソルバー破綻＆重み逆転防止検証追加
@@ -805,7 +806,7 @@ fn test_12_full_spec_audit_v1_2_0() {
         }
     }
 
-    // 4. 2階裏_基本人数 (sec_2f_back_base_cap = 3) の日次最低人数確保検証
+    // 4. 2階裏_基本人数 (sec_2f_back_base_cap = 3) の日次最低人数確保検証（v1.3.4t: 有休1名までは減算せず3名維持、2名以上は減算）
     let res_sep = solve_shift(&parsed, 2026, 9, &holidays);
     assert!(res_sep.success && res_sep.stage == 1);
     let core_2f_b: Vec<&shift_core::parser::Staff> = parsed
@@ -815,18 +816,34 @@ fn test_12_full_spec_audit_v1_2_0() {
         .collect();
     for &d in &ctx_sep.clinic_days {
         let dt = ctx_sep.date_map[&d];
+        let is_ope = shift_core::parser::is_ope_date(&parsed.ope_dict, &dt);
         let vac_cnt = core_2f_b
             .iter()
             .filter(|s| {
-                s.vacation_dates.contains(&dt)
-                    || s.special_vacation_dates.contains(&dt)
-                    || s.preferred_off_dates.contains(&dt)
-                    || s.specified_off_dates.contains(&dt)
+                !(is_ope && s.name == "石橋")
+                    && (s.vacation_dates.contains(&dt)
+                        || s.special_vacation_dates.contains(&dt)
+                        || s.preferred_off_dates.contains(&dt)
+                        || s.specified_off_dates.contains(&dt))
             })
             .count() as i32;
-        let expected_min = (parsed.config.sec_2f_back_base_cap - vac_cnt).max(0) as u32;
+        let avail_cnt = core_2f_b
+            .iter()
+            .filter(|s| {
+                !(is_ope && s.name == "石橋")
+                    && !s.vacation_dates.contains(&dt)
+                    && !s.special_vacation_dates.contains(&dt)
+                    && !s.preferred_off_dates.contains(&dt)
+                    && !s.specified_off_dates.contains(&dt)
+            })
+            .count() as i32;
+        let vac_deduct = if is_ope { 0 } else { (vac_cnt - 1).max(0) };
+        let expected_min = (parsed.config.sec_2f_back_base_cap - vac_deduct)
+            .min(avail_cnt)
+            .max(0) as u32;
         let actual_2f_b: u32 = core_2f_b
             .iter()
+            .filter(|s| !(is_ope && s.name == "石橋"))
             .map(|s| res_sep.shifts[&s.name][&d] as u32)
             .sum();
         assert!(
@@ -1083,11 +1100,11 @@ fn test_13_v1_3_0_2f_back_and_ishibashi_rules() {
                     d,
                     out_exam
                 );
-                // 3-1 ソフト目標: 木曜・金曜等のOpe日で 看護師2＋検査2＝4名 が達成されていること
-                assert_eq!(
-                    (out_nurse, out_exam),
-                    (2, 2),
-                    "9/{} (Ope日) で推奨目標の看護師2＋検査2（石橋さん除く）が達成されていること",
+                // 3-1: 火曜以外のOpe日で 看護師1〜2＋検査2（計3〜4名、石橋さん除く）が達成されていること
+                // （v1.3.5より堀さんの週4維持 10M > Ope推奨 3.5M のため、堀さんを無理に週5化せず 看護師>=1, 検査==2 を維持）
+                assert!(
+                    (out_nurse == 1 || out_nurse == 2) && out_exam == 2,
+                    "9/{} (Ope日) で看護師1〜2名＋検査2名（石橋さん除く）が達成されていること",
                     d
                 );
             }
@@ -1574,6 +1591,81 @@ fn test_16_v1_3_3_ope_types_and_no_marked_months() {
         cat_days,
         vec![2, 4, 9],
         "勤務シフト条件上は vit / Vit,cat も cat と同じ条件として扱われること"
+    );
+}
+
+// ============================================================================
+// 17. test_17_v1_3_4t_no_2f_back_vac_auto_deduction:
+//     v1.3.4t テスト仕様:
+//       (1) 2階裏の日次最低出勤人数は有休・指定公休1名までは減算せず3名維持、2名以上の日は(人数-1)分を減算
+//       (2) 堀さん（必要に応じて週5）の超過出勤ペナルティ引き上げにより、通常月は所定日数（週4基準）に抑えられること
+//       (3) 職種別の隠れ必要人数が事前診断に反映され Stage 1 で破綻しないこと
+// ============================================================================
+#[test]
+fn test_17_v1_3_4t_no_2f_back_vac_auto_deduction() {
+    let (parsed, holidays) = load_test_excel();
+
+    // (A) WEIGHT_SPECIAL_EXTRA_WORK 引き上げ (150k -> 10M) および週休平準化基準の週4化により、
+    //     通常月(2026年9月)では堀さんの週5超過出勤が一切発生せず、所定日数 (target_days=15日, 週4日勤務) ピッタリに抑えられること
+    let res_sep_base = solve_shift(&parsed, 2026, 9, &holidays);
+    assert!(res_sep_base.success && res_sep_base.stage == 1);
+    let hori_target_sep = res_sep_base.target_days["堀"];
+    let hori_actual_sep: i32 = res_sep_base.shifts["堀"].values().map(|&v| v as i32).sum();
+    assert_eq!(
+        hori_actual_sep, hori_target_sep,
+        "2026年9月で堀さんの出勤日数({})が週4所定日数(target={})ピッタリに抑えられること",
+        hori_actual_sep,
+        hori_target_sep
+    );
+
+    // (B) 2026年9月カスタム:
+    //   - 9/7(月): 小島=有休 (1名休み → 減算せず 3名以上維持)
+    //   - 9/11(金): 堀=指定公休 (1名休み → 減算せず 3名以上維持)
+    //   - 9/2(水, Ope除外): 小島=有休, 堀=指定公休 (2名休み → 1名減算して2名体制許容＆石橋さんの水曜公休も維持)
+    let mut custom = parsed.clone();
+    custom
+        .ope_dict
+        .remove(&NaiveDate::from_ymd_opt(2026, 9, 2).unwrap());
+
+    let d_sep2 = NaiveDate::from_ymd_opt(2026, 9, 2).unwrap();
+    let d_sep7 = NaiveDate::from_ymd_opt(2026, 9, 7).unwrap();
+    let d_sep11 = NaiveDate::from_ymd_opt(2026, 9, 11).unwrap();
+    for st in &mut custom.staffs {
+        if st.name == "小島" {
+            st.vacation_dates.insert(d_sep2);
+            st.vacation_dates.insert(d_sep7);
+        } else if st.name == "堀" {
+            st.specified_off_dates.insert(d_sep2);
+            st.specified_off_dates.insert(d_sep11);
+        }
+    }
+
+    let res = solve_shift(&custom, 2026, 9, &holidays);
+    assert!(
+        res.success && res.stage == 1,
+        "2階裏(1名減算なし・2名以上減算)テストケースが Stage 1 で解けること: {:?}",
+        res.logs
+    );
+
+    let names_2f_b = ["長谷川", "小島", "堀", "江原", "石橋"];
+    for d in [7u32, 11u32] {
+        let cnt: u32 = names_2f_b.iter().map(|&n| res.shifts[n][&d] as u32).sum();
+        assert!(
+            cnt >= 3,
+            "9/{} は有休/指定公休が1名のため減算せず 2階裏3名以上を維持すること (実: {}名)",
+            d,
+            cnt
+        );
+    }
+    let cnt_sep2: u32 = names_2f_b.iter().map(|&n| res.shifts[n][&2] as u32).sum();
+    assert!(
+        cnt_sep2 >= 2,
+        "9/2(水) は有休/指定公休が2名のため1名減算の2名以上が確保されること (実: {}名)",
+        cnt_sep2
+    );
+    assert_eq!(
+        res.shifts["石橋"][&2], 0,
+        "9/2(水) は2名有休により最低人数が2名へ減算されるため、石橋さんの非Ope水曜公休(0)も維持されること"
     );
 }
 

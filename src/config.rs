@@ -1,7 +1,8 @@
 //! 勤務シフト自動生成システム 設定モジュール (`config.rs`)
 //!
-//! Version: v1.3.1
-//! Updated: 2026-11-10 - v1.3.1 Stage 2 所定勤務日数防衛重み (WEIGHT_TARGET_DAYS_SLACK=25M) および連勤上限緊急緩和重み (WEIGHT_CONSEC_WORK_SLACK=28M) 追加
+//! Version: v1.3.5
+//! Updated: 2026-11-17 - v1.3.5 特別枠（堀さん：必要に応じて週5）の超過出勤ペナルティ引き上げ (150k -> 10M)
+//! - v1.3.1 (2026-11-10): Stage 2 所定勤務日数防衛重み (WEIGHT_TARGET_DAYS_SLACK=25M) および連勤上限緊急緩和重み (WEIGHT_CONSEC_WORK_SLACK=28M) 追加
 //! - v1.3.0 (2026-11-08): 2階裏職種バランス・Ope推奨・石橋さん水曜公休・早上がり重複回避＆フルタイム増員ペナルティ定数追加
 //! - v1.2.0 (2026-11-01): 全15設定項目・全固定ペナルティ重みの完全連動 (HIGH1推奨重み 10.2M 微調整で一般セクションブレ幅スラック 10M より上位を確定)
 //! - v1.1.0 (2026-10-31): HIGH1推奨人数ペナルティ引き上げおよび主公休スライド許容スラック重み追加
@@ -148,8 +149,8 @@ pub const WEIGHT_WEEKLY_OFF_DIFF: i64 = 300_000;
 pub const WEIGHT_PREV_OFF_REPEAT: i64 = 300_000;
 /// 2階裏 看護師が推奨人数未満の日のペナルティ
 pub const WEIGHT_NURSE_LT2_PENALTY: i64 = 200_000;
-/// 「必要に応じて週5」スタッフの所定超過出勤1日あたりペナルティ
-pub const WEIGHT_SPECIAL_EXTRA_WORK: i64 = 150_000;
+/// 「必要に応じて週5」スタッフの所定超過出勤1日あたりペナルティ（通常時は週4を維持し、2階裏最低人数や職種別必須人数が回らない非常時のみ週5化）
+pub const WEIGHT_SPECIAL_EXTRA_WORK: i64 = 10_000_000;
 /// 7日間ローリング週休平準化ペナルティ
 pub const WEIGHT_ROLLING_WINDOW_DIFF: i64 = 80_000;
 /// 月末3日間の公休偏り抑制ペナルティ
