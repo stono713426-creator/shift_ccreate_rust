@@ -1,7 +1,8 @@
 //! 勤務シフト自動生成システム エントリーポイント (`main.rs`)
 //!
-//! Version: v1.3.5
-//! Updated: 2026-11-17 - v1.3.5 2階裏の日次最低出勤人数（1名まで減算なし）・堀さん週4基準維持リリース同期
+//! Version: v2.0.0
+//! Updated: 2026-11-21 - v2.0.0 厳格探索＋適切解なし明示（自動緩和なし）・原因診断/推奨緩和案コンソール出力・祝日年範囲動的化
+//! - v1.3.5 (2026-11-17): 2階裏の日次最低出勤人数（1名まで減算なし）・堀さん週4基準維持リリース同期
 //! - v1.3.4 (2026-11-17): vit/cat条件同一化リリース同期
 //! - v1.3.3 (2026-11-17): 手術種別4種整理・作成対象列廃止リリース同期
 //! - v1.3.2 (2026-11-10): Windows GUIサブシステム化（ダブルクリック起動時のコンソール非表示）およびCLI実行時AttachConsole対応
@@ -19,10 +20,8 @@
 
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
-use shift_core::generator::{GenerateOptions, ShiftGenerator};
+use shift_core::generator::{parse_excel_with_dynamic_holidays, GenerateOptions, ShiftGenerator};
 use shift_core::gui::run_gui;
-use shift_core::holidays::get_holidays;
-use shift_core::parser::parse_shift_excel;
 use shift_core::VERSION;
 use std::env;
 use std::path::{Path, PathBuf};
@@ -115,37 +114,42 @@ fn run_cli_batch(input_path: &Path, output_path: Option<PathBuf>) {
     }
 
     let total_start = Instant::now();
-    println!("1. 祝日カレンダーの取得・計算中...");
-    let holidays = get_holidays(2024, 2030);
-    println!("   祝日登録件数: {}件", holidays.len());
-
-    println!("2. 勤務条件表の解析中: {}", input_path.display());
+    println!("1. 勤務条件表および祝日カレンダーの解析中: {}", input_path.display());
     let parse_start = Instant::now();
-    let parsed = match parse_shift_excel(input_path, &holidays) {
-        Ok(p) => p,
+    let (parsed, holidays) = match parse_excel_with_dynamic_holidays(input_path) {
+        Ok(res) => res,
         Err(e) => {
             eprintln!("エラー: 入力Excelの解析に失敗しました: {}", e);
             std::process::exit(1);
         }
     };
     println!(
-        "   解析完了 ({:.2}秒): スタッフ数={}名, 制約数={}件, 手術日程={}日, 作成対象月={:?}",
+        "   解析完了 ({:.2}秒): 祝日登録={}件, スタッフ数={}名, 制約数={}件, 手術日程={}日, 作成対象月={:?}",
         parse_start.elapsed().as_secs_f64(),
+        holidays.len(),
         parsed.staffs.len(),
         parsed.rules.len(),
         parsed.ope_dict.len(),
         parsed.target_months
     );
 
+    if !parsed.parse_warnings.is_empty() {
+        println!("   [入力チェック通知]");
+        for w in &parsed.parse_warnings {
+            println!("     {w}");
+        }
+    }
+
     if parsed.target_months.is_empty() {
         eprintln!("エラー: 手術スケジュールシート等から作成対象月が検出されませんでした。");
         std::process::exit(1);
     }
 
-    println!("3. 複数月シフトの二段階数理最適化 (MILP / HiGHS) を開始...");
+    println!("2. 複数月シフトの厳格最適化 (MILP / HiGHS・自動緩和なし) を開始...");
     let options = GenerateOptions {
         target_months: Some(parsed.target_months.clone()),
         output_path,
+        approved_relaxations_by_month: Default::default(),
     };
 
     let result = ShiftGenerator::generate(&parsed, &holidays, &options, |idx, total, y, m, msg| {
@@ -158,18 +162,54 @@ fn run_cli_batch(input_path: &Path, output_path: Option<PathBuf>) {
 
     match result {
         Ok((out_file, month_results)) => {
+            let failed_cnt = month_results.iter().filter(|(_, _, r)| !r.success).count();
             println!("============================================================");
-            println!("🎉 シフト生成が正常に完了しました！");
-            println!("   出力ファイル: {}", out_file.display());
+            if failed_cnt == 0 {
+                println!("🎉 全月のシフト生成が厳格条件で正常に完了しました！");
+            } else {
+                println!(
+                    "⚠️ シフト生成が完了しましたが、{} ヶ月が「適切解なし（未生成）」となりました。",
+                    failed_cnt
+                );
+                println!("   ※ 実務妥当性を維持するため、無承認での自動緩和は行っていません。");
+            }
+            println!("   出力ファイル: {}（末尾に「生成診断レポート」シート出力済み）", out_file.display());
             println!("   総所要時間  : {:.2}秒", total_start.elapsed().as_secs_f64());
             println!("   生成月内訳  :");
-            for (y, m, res) in month_results {
+            for (y, m, res) in &month_results {
                 let status_str = if res.success {
-                    format!("成功 (Stage {}, {:.2}s)", res.stage, res.execution_time_secs)
+                    if res.stage == 1 {
+                        format!("✅ 厳格達成 ({:.2}s)", res.execution_time_secs)
+                    } else {
+                        format!(
+                            "⚠️ 承認緩和あり {}件 ({:.2}s)",
+                            res.approved_relaxations.len(),
+                            res.execution_time_secs
+                        )
+                    }
                 } else {
-                    "失敗 (INFEASIBLE)".to_string()
+                    "❌ 適切解なし (未生成)".to_string()
                 };
                 println!("     - {}年{:02}月: {}", y, m, status_str);
+                if let Some(ref diag) = res.diagnosis {
+                    println!("       原因サマリー: {}", diag.summary);
+                    for c in &diag.causes {
+                        println!("         ・[{}] {}: {}", c.category, c.scope_label, c.detail);
+                    }
+                    if !diag.proposals.is_empty() {
+                        println!("       推奨/代替緩和候補（GUIでチェック選択して再生成可能）:");
+                        for p in &diag.proposals {
+                            let tag = if p.is_last_resort {
+                                "最終手段"
+                            } else if p.recommended {
+                                "推奨"
+                            } else {
+                                "代替"
+                            };
+                            println!("         * [{}] {} — {}", tag, p.label, p.impact_desc);
+                        }
+                    }
+                }
             }
             println!("============================================================");
         }

@@ -1,7 +1,8 @@
 //! 勤務シフト自動生成システム 現場フォーマット Excel レンダラー (`renderer.rs`)
 //!
-//! Version: v1.3.1
-//! Updated: 2026-11-10 - v1.3.1 シート名重複回避・空リスト時のフォールバック等の防御処理強化
+//! Version: v2.0.0
+//! Updated: 2026-11-21 - v2.0.0 属性ベース(is_ope_dedicated)数式除外対応・共通休診日の⚠️誤表示修正・未生成シート診断出力・末尾「生成診断レポート」シート追加
+//! - v1.3.1 (2026-11-10): シート名重複回避・空リスト時のフォールバック等の防御処理強化
 //! - v1.3.0 (2026-11-08): Ope日（注射以外の手術日）における石橋さんの「2階裏（外来）人数」列数式および警告カウントからの除外対応
 //! - v1.2.0 (2026-11-01): リリースバージョン同期
 //! - v1.0.0 (2026-10-31): Phase 3 実装: SPECIFICATION.md セクション6 完全準拠の現場フォーマット Excel 出力
@@ -25,7 +26,8 @@
 //!   - 下部集計4行: 合計出勤日数 (=COUNTIF), 所定勤務日数, 公休日数 (=COUNTIF), 主公休曜日
 
 use crate::parser::{is_ope_date, OffType, ParsedExcelData, Staff};
-use crate::solver::{MonthContext, SolveResult};
+use crate::solver::{compute_common_sp_vac, MonthContext, SolveResult};
+use crate::VERSION;
 use chrono::NaiveDate;
 use rust_xlsxwriter::{
     Color, Format, FormatAlign, FormatBorder, Workbook, Worksheet, XlsxError,
@@ -328,7 +330,7 @@ struct SheetLayout {
     sec1_count_col: Option<u16>,
     sec2_count_col: Option<u16>,
     sec3_count_col: Option<u16>,
-    sec2_ishibashi_col: Option<u16>,
+    sec2_ope_dedicated_cols: Vec<u16>,
 }
 
 impl SheetLayout {
@@ -347,7 +349,7 @@ impl SheetLayout {
         let mut sec1_count_col = None;
         let mut sec2_count_col = None;
         let mut sec3_count_col = None;
-        let mut sec2_ishibashi_col = None;
+        let mut sec2_ope_dedicated_cols = Vec::new();
 
         let sections = [
             ("2階表", true),
@@ -367,8 +369,8 @@ impl SheetLayout {
                 let start_c = columns.len() as u16;
                 for s in staffs {
                     let cur_c = columns.len() as u16;
-                    if sec_name == "2階裏" && s.name == "石橋" {
-                        sec2_ishibashi_col = Some(cur_c);
+                    if sec_name == "2階裏" && s.is_ope_dedicated {
+                        sec2_ope_dedicated_cols.push(cur_c);
                     }
                     columns.push(ColType::Staff(s));
                 }
@@ -408,7 +410,7 @@ impl SheetLayout {
             sec1_count_col,
             sec2_count_col,
             sec3_count_col,
-            sec2_ishibashi_col,
+            sec2_ope_dedicated_cols,
         }
     }
 }
@@ -507,7 +509,8 @@ fn render_month_sheet(
     }
 
     // 5. 日付データ行 (row = 2 ..= days_in_month + 1)
-    let warn_threshold = ctx.parsed.config.warn_2f_back_count; // デフォルト4名
+    let warn_threshold = ctx.parsed.config.warn_2f_back_count;
+    let common_sp_vac = compute_common_sp_vac(ctx.parsed, &month_ctx);
 
     for d in 1..=month_ctx.days_in_month {
         let row_idx = d + 1; // 0-indexed
@@ -517,6 +520,8 @@ fn render_month_sheet(
         let is_holiday = month_ctx.is_holiday_map[&d];
         let is_sunday = weekday_num == 6;
         let is_closed = is_sunday || is_holiday;
+        let is_common_closure = common_sp_vac.contains(&date);
+        let is_clinic_closure = is_closed || is_common_closure;
 
         // 備考テキスト
         let mut desc = String::new();
@@ -525,16 +530,16 @@ fn render_month_sheet(
         } else if let Some(ope) = ctx.parsed.ope_dict.get(&date) {
             desc = ope.clone();
         }
-        // 仕様 1-2 & 2-2: 「注射」以外のオペがある日を「Ope日」と判定
+        // 「注射」以外のオペがある日を「Ope日」と判定
         let is_ope_day = is_ope_date(&ctx.parsed.ope_dict, &date);
         let has_any_ope_or_inj = ctx.parsed.ope_dict.contains_key(&date);
 
-        // 2階裏（外来）出勤数カウント（警告判定用：Ope日は石橋さんを外来人数から除外）
+        // 2階裏（外来）出勤数カウント（警告判定用：休診日除外・Ope日はOpe専従者を除外）
         let mut count_2f_back = 0;
-        if !is_closed {
+        if !is_clinic_closure {
             for col in &layout.columns {
                 if let ColType::Staff(ref s) = col {
-                    if s.section == "2階裏" && !(is_ope_day && s.name == "石橋") {
+                    if s.section == "2階裏" && !(is_ope_day && s.is_ope_dedicated) {
                         if let Some(shifts) = ctx.result.shifts.get(&s.name) {
                             if shifts.get(&d) == Some(&1) {
                                 count_2f_back += 1;
@@ -577,6 +582,8 @@ fn render_month_sheet(
                 ColType::Fixed(FixedCol::Warn) => {
                     if is_closed {
                         worksheet.write_string_with_format(row_idx, c, "", &fmt.holiday_warn)?;
+                    } else if is_common_closure {
+                        worksheet.write_string_with_format(row_idx, c, "", &fmt.data_warn_empty)?;
                     } else if count_2f_back <= warn_threshold {
                         worksheet.write_string_with_format(row_idx, c, "⚠️", &fmt.data_warn_alert)?;
                     } else {
@@ -649,26 +656,23 @@ fn render_month_sheet(
                     if let Some((start_c, end_c)) = range_opt {
                         let c1 = col_to_letter(start_c);
                         let c2 = col_to_letter(end_c);
-                        if !is_closed && is_ope_day && sec_name == "2階裏" {
-                            if let Some(ishi_c) = layout.sec2_ishibashi_col {
-                                if start_c == end_c && start_c == ishi_c {
-                                    worksheet.write_number_with_format(row_idx, c, 0.0, f)?;
-                                } else {
-                                    let ishi_letter = col_to_letter(ishi_c);
-                                    let formula = format!(
-                                        "=COUNTIF({0}{2}:{1}{2}, \"○\")-COUNTIF({3}{2}, \"○\")",
-                                        c1, c2, excel_row, ishi_letter
-                                    );
-                                    worksheet.write_formula_with_format(
-                                        row_idx,
-                                        c,
-                                        formula.as_str(),
-                                        f,
-                                    )?;
-                                }
+                        if !is_clinic_closure
+                            && is_ope_day
+                            && sec_name == "2階裏"
+                            && !layout.sec2_ope_dedicated_cols.is_empty()
+                        {
+                            let sec_width = (end_c - start_c + 1) as usize;
+                            if layout.sec2_ope_dedicated_cols.len() >= sec_width {
+                                worksheet.write_number_with_format(row_idx, c, 0.0, f)?;
                             } else {
-                                let formula =
-                                    format!("=COUNTIF({}{}:{}{}, \"○\")", c1, excel_row, c2, excel_row);
+                                let mut formula =
+                                    format!("=COUNTIF({c1}{excel_row}:{c2}{excel_row}, \"○\")");
+                                for &ded_c in &layout.sec2_ope_dedicated_cols {
+                                    let ded_letter = col_to_letter(ded_c);
+                                    formula.push_str(&format!(
+                                        "-COUNTIF({ded_letter}{excel_row}, \"○\")"
+                                    ));
+                                }
                                 worksheet.write_formula_with_format(
                                     row_idx,
                                     c,
@@ -826,8 +830,8 @@ fn render_month_sheet(
 
 /// スタッフの主公休曜日表示文字列を計算する
 fn get_staff_main_off_display(staff: &Staff, result: &SolveResult) -> String {
-    let has_rotating_second_off = (staff.is_core || staff.name == "石橋")
-        && (staff.pattern.contains("週4") || staff.name == "石橋")
+    let has_rotating_second_off = (staff.is_core || staff.is_holiday_independent_week4)
+        && (staff.pattern.contains("週4") || staff.is_holiday_independent_week4)
         && staff.basic_off_days.len() == 1
         && staff.basic_off_type == OffType::And;
 
@@ -855,6 +859,314 @@ fn get_staff_main_off_display(staff: &Staff, result: &SolveResult) -> String {
     } else {
         "-".to_string()
     }
+}
+
+/// 未生成（適切解なし）月の診断シートを描画する
+fn render_unsolved_month_sheet(
+    worksheet: &mut Worksheet,
+    year: i32,
+    month: u32,
+    result: &SolveResult,
+    fmt: &FormatSet,
+) -> Result<(), XlsxError> {
+    worksheet.set_column_width(0, 22.0)?;
+    worksheet.set_column_width(1, 20.0)?;
+    worksheet.set_column_width(2, 54.0)?;
+    worksheet.set_column_width(3, 44.0)?;
+
+    let title_fmt = Format::new()
+        .set_font_name("メイリオ")
+        .set_font_size(13)
+        .set_bold()
+        .set_font_color(Color::RGB(0xC00000));
+    let sec_fmt = Format::new()
+        .set_font_name("メイリオ")
+        .set_font_size(11)
+        .set_bold()
+        .set_font_color(Color::RGB(0x1F4E78));
+    let cell_l = Format::new()
+        .set_font_name("メイリオ")
+        .set_font_size(10)
+        .set_align(FormatAlign::Left)
+        .set_align(FormatAlign::VerticalCenter)
+        .set_text_wrap()
+        .set_border(FormatBorder::Thin)
+        .set_border_color(Color::RGB(0xBFBFBF));
+
+    let mut row = 0u32;
+    worksheet.set_row_height(row, 28.0)?;
+    worksheet.write_string_with_format(
+        row,
+        0,
+        format!("{}年{:02}月 勤務シフト未生成（厳格条件では適切解なし）", year, month),
+        &title_fmt,
+    )?;
+    row += 2;
+
+    if let Some(ref diag) = result.diagnosis {
+        worksheet.write_string_with_format(row, 0, "■ 診断サマリー", &sec_fmt)?;
+        row += 1;
+        worksheet.write_string_with_format(row, 0, &diag.summary, &cell_l)?;
+        row += 2;
+
+        worksheet.write_string_with_format(row, 0, "■ 検出された原因", &sec_fmt)?;
+        row += 1;
+        for (c, h) in ["カテゴリ", "対象範囲", "詳細"].iter().enumerate() {
+            worksheet.write_string_with_format(row, c as u16, *h, &fmt.header_date)?;
+        }
+        row += 1;
+        for cause in &diag.causes {
+            worksheet.set_row_height(row, 24.0)?;
+            worksheet.write_string_with_format(row, 0, &cause.category, &cell_l)?;
+            worksheet.write_string_with_format(row, 1, &cause.scope_label, &cell_l)?;
+            worksheet.write_string_with_format(row, 2, &cause.detail, &cell_l)?;
+            row += 1;
+        }
+        row += 1;
+
+        if !diag.proposals.is_empty() {
+            worksheet.write_string_with_format(row, 0, "■ 提案された緩和候補（GUIでチェック選択可能）", &sec_fmt)?;
+            row += 1;
+            for (c, h) in ["区分", "緩和候補", "影響説明"].iter().enumerate() {
+                worksheet.write_string_with_format(row, c as u16, *h, &fmt.header_2f_back)?;
+            }
+            row += 1;
+            for p in &diag.proposals {
+                let kind_tag = if p.is_last_resort {
+                    "最終手段"
+                } else if p.recommended {
+                    "推奨"
+                } else {
+                    "代替"
+                };
+                worksheet.set_row_height(row, 24.0)?;
+                worksheet.write_string_with_format(row, 0, kind_tag, &cell_l)?;
+                worksheet.write_string_with_format(row, 1, &p.label, &cell_l)?;
+                worksheet.write_string_with_format(row, 2, &p.impact_desc, &cell_l)?;
+                row += 1;
+            }
+            row += 1;
+        }
+    }
+
+    worksheet.write_string_with_format(row, 0, "■ 実行ログ", &sec_fmt)?;
+    row += 1;
+    for log in &result.logs {
+        worksheet.write_string(row, 0, log)?;
+        row += 1;
+    }
+    Ok(())
+}
+
+/// ブック末尾に「生成診断レポート」シートを描画する
+fn render_diagnosis_report_sheet(
+    worksheet: &mut Worksheet,
+    results: &[(i32, u32, SolveResult)],
+    fmt: &FormatSet,
+) -> Result<(), XlsxError> {
+    worksheet.set_landscape();
+    worksheet.set_paper_size(9);
+    worksheet.set_print_fit_to_pages(1, 0);
+
+    let widths = [14.0, 22.0, 14.0, 14.0, 14.0, 16.0, 16.0, 16.0, 16.0];
+    for (c, &w) in widths.iter().enumerate() {
+        worksheet.set_column_width(c as u16, w)?;
+    }
+
+    let sec_fmt = Format::new()
+        .set_font_name("メイリオ")
+        .set_font_size(11)
+        .set_bold()
+        .set_font_color(Color::RGB(0x1F4E78));
+    let cell_c = Format::new()
+        .set_font_name("メイリオ")
+        .set_font_size(10)
+        .set_align(FormatAlign::Center)
+        .set_align(FormatAlign::VerticalCenter)
+        .set_border(FormatBorder::Thin)
+        .set_border_color(Color::RGB(0xBFBFBF));
+    let cell_l = Format::new()
+        .set_font_name("メイリオ")
+        .set_font_size(10)
+        .set_align(FormatAlign::Left)
+        .set_align(FormatAlign::VerticalCenter)
+        .set_text_wrap()
+        .set_border(FormatBorder::Thin)
+        .set_border_color(Color::RGB(0xBFBFBF));
+    let cell_warn = cell_c
+        .clone()
+        .set_font_color(Color::RGB(0xC00000))
+        .set_background_color(Color::RGB(0xFCE4D6))
+        .set_bold();
+    let cell_ok = cell_c
+        .clone()
+        .set_font_color(Color::RGB(0x006100))
+        .set_background_color(Color::RGB(0xE2EFDA))
+        .set_bold();
+
+    let mut row = 0u32;
+    worksheet.set_row_height(row, 28.0)?;
+    worksheet.write_string_with_format(
+        row,
+        0,
+        format!("勤務シフト生成 診断レポート ({VERSION})"),
+        &fmt.title,
+    )?;
+    row += 2;
+
+    // 1. 月別生成サマリー
+    worksheet.write_string_with_format(row, 0, "■ 1. 月別生成サマリー", &sec_fmt)?;
+    row += 1;
+    let sum_headers = [
+        "対象年月",
+        "判定",
+        "所要時間(秒)",
+        "承認緩和数",
+        "推奨未達数",
+        "主公休スライド",
+        "早上がり重複",
+        "2階裏警告日数",
+        "固定公休振替",
+    ];
+    worksheet.set_row_height(row, 26.0)?;
+    for (c, h) in sum_headers.iter().enumerate() {
+        worksheet.write_string_with_format(row, c as u16, *h, &fmt.header_date)?;
+    }
+    row += 1;
+
+    for (y, m, res) in results {
+        worksheet.set_row_height(row, 22.0)?;
+        worksheet.write_string_with_format(row, 0, format!("{y}年{m:02}月"), &cell_c)?;
+        let (status_label, status_fmt) = if !res.success {
+            ("適切解なし(未生成)", &cell_warn)
+        } else if res.stage == 1 {
+            ("厳格達成", &cell_ok)
+        } else {
+            ("承認緩和あり", &cell_c)
+        };
+        worksheet.write_string_with_format(row, 1, status_label, status_fmt)?;
+        worksheet.write_number_with_format(row, 2, (res.execution_time_secs * 100.0).round() / 100.0, &cell_c)?;
+        if res.success {
+            worksheet.write_number_with_format(row, 3, res.approved_relaxations.len() as f64, &cell_c)?;
+            worksheet.write_number_with_format(row, 4, res.audit.rec_misses.len() as f64, &cell_c)?;
+            worksheet.write_number_with_format(row, 5, res.audit.main_off_slides.len() as f64, &cell_c)?;
+            worksheet.write_number_with_format(row, 6, res.audit.early_overlaps.len() as f64, &cell_c)?;
+            worksheet.write_number_with_format(row, 7, res.audit.warn_2f_back_days.len() as f64, &cell_c)?;
+            worksheet.write_number_with_format(row, 8, res.audit.fixed_off_swaps.len() as f64, &cell_c)?;
+        } else {
+            for c in 3..=8 {
+                worksheet.write_string_with_format(row, c, "-", &cell_c)?;
+            }
+        }
+        row += 1;
+    }
+    row += 1;
+
+    // 2. 承認済み緩和条件一覧
+    worksheet.write_string_with_format(row, 0, "■ 2. 承認済み緩和条件一覧", &sec_fmt)?;
+    row += 1;
+    worksheet.set_row_height(row, 24.0)?;
+    worksheet.write_string_with_format(row, 0, "対象年月", &fmt.header_2f_back)?;
+    worksheet.write_string_with_format(row, 1, "適用した緩和内容", &fmt.header_2f_back)?;
+    row += 1;
+    let mut has_any_relax = false;
+    for (y, m, res) in results {
+        for item in &res.audit.applied_relaxations {
+            has_any_relax = true;
+            worksheet.set_row_height(row, 22.0)?;
+            worksheet.write_string_with_format(row, 0, format!("{y}年{m:02}月"), &cell_c)?;
+            worksheet.write_string_with_format(row, 1, item, &cell_l)?;
+            row += 1;
+        }
+    }
+    if !has_any_relax {
+        worksheet.write_string_with_format(row, 0, "-", &cell_c)?;
+        worksheet.write_string_with_format(row, 1, "承認緩和なし（生成された全月が厳格条件で達成）", &cell_l)?;
+        row += 1;
+    }
+    row += 1;
+
+    // 3. 適切解なし月の原因診断・推奨緩和案
+    let failed_months: Vec<&(i32, u32, SolveResult)> =
+        results.iter().filter(|(_, _, r)| !r.success).collect();
+    if !failed_months.is_empty() {
+        worksheet.write_string_with_format(row, 0, "■ 3. 適切解なし月の原因診断・推奨緩和案", &sec_fmt)?;
+        row += 1;
+        for (c, h) in ["対象年月", "区分", "対象", "内容"].iter().enumerate() {
+            worksheet.write_string_with_format(row, c as u16, *h, &fmt.header_warn)?;
+        }
+        row += 1;
+        for (y, m, res) in failed_months {
+            if let Some(ref diag) = res.diagnosis {
+                for cause in &diag.causes {
+                    worksheet.set_row_height(row, 24.0)?;
+                    worksheet.write_string_with_format(row, 0, format!("{y}年{m:02}月"), &cell_c)?;
+                    worksheet.write_string_with_format(row, 1, &cause.category, &cell_l)?;
+                    worksheet.write_string_with_format(row, 2, &cause.scope_label, &cell_l)?;
+                    worksheet.write_string_with_format(row, 3, &cause.detail, &cell_l)?;
+                    row += 1;
+                }
+                for p in &diag.proposals {
+                    let tag = if p.is_last_resort {
+                        "緩和案(最終手段)"
+                    } else if p.recommended {
+                        "緩和案(推奨)"
+                    } else {
+                        "緩和案(代替)"
+                    };
+                    worksheet.set_row_height(row, 24.0)?;
+                    worksheet.write_string_with_format(row, 0, format!("{y}年{m:02}月"), &cell_c)?;
+                    worksheet.write_string_with_format(row, 1, tag, &cell_l)?;
+                    worksheet.write_string_with_format(row, 2, &p.label, &cell_l)?;
+                    worksheet.write_string_with_format(row, 3, &p.impact_desc, &cell_l)?;
+                    row += 1;
+                }
+            }
+        }
+        row += 1;
+    }
+
+    // 4. 品質詳細（所定調整・振替出勤・推奨未達・警告日・主公休スライド・重複）
+    worksheet.write_string_with_format(row, 0, "■ 4. 品質詳細ログ", &sec_fmt)?;
+    row += 1;
+    for (c, h) in ["対象年月", "項目", "詳細"].iter().enumerate() {
+        worksheet.write_string_with_format(row, c as u16, *h, &fmt.header_1f)?;
+    }
+    row += 1;
+
+    let mut has_detail = false;
+    for (y, m, res) in results {
+        if !res.success {
+            continue;
+        }
+        let ym = format!("{y}年{m:02}月");
+        let groups: &[(&str, &[String])] = &[
+            ("所定勤務日数不一致", &res.audit.target_mismatches),
+            ("週5応援発動", &res.audit.special_extra_work_days),
+            ("固定公休振替出勤", &res.audit.fixed_off_swaps),
+            ("推奨体制未達", &res.audit.rec_misses),
+            ("2階裏警告日", &res.audit.warn_2f_back_days),
+            ("早上がり重複", &res.audit.early_overlaps),
+            ("主公休スライド", &res.audit.main_off_slides),
+        ];
+        for &(label, items) in groups {
+            for item in items {
+                has_detail = true;
+                worksheet.set_row_height(row, 22.0)?;
+                worksheet.write_string_with_format(row, 0, &ym, &cell_c)?;
+                worksheet.write_string_with_format(row, 1, label, &cell_l)?;
+                worksheet.write_string_with_format(row, 2, item, &cell_l)?;
+                row += 1;
+            }
+        }
+    }
+    if !has_detail {
+        worksheet.write_string_with_format(row, 0, "-", &cell_c)?;
+        worksheet.write_string_with_format(row, 1, "-", &cell_c)?;
+        worksheet.write_string_with_format(row, 2, "特記事項なし（所定完全一致・推奨全達成・警告日なし）", &cell_l)?;
+    }
+
+    Ok(())
 }
 
 /// 複数月のシフト結果を単一の現場フォーマット Excel ファイルへ出力する。
@@ -897,14 +1209,20 @@ pub fn render_shifts_to_file<P: AsRef<Path>>(
             };
             render_month_sheet(worksheet, &ctx, &fmt)?;
         } else {
-            // 失敗時はエラーサマリーを出力
-            worksheet.write_string(0, 0, "シフト自動生成に失敗しました（INFEASIBLE）")?;
-            worksheet.write_string(1, 0, format!("対象年月: {}年{}月", year, month))?;
-            for (idx, log) in result.logs.iter().enumerate() {
-                worksheet.write_string((idx + 3) as u32, 0, log)?;
-            }
+            render_unsolved_month_sheet(worksheet, *year, *month, result, &fmt)?;
         }
     }
+
+    // ブック末尾に「生成診断レポート」シートを追加
+    let mut report_name = "生成診断レポート".to_string();
+    let mut r_idx = 2usize;
+    while used_sheet_names.contains(&report_name) {
+        report_name = format!("生成診断レポート_{r_idx}");
+        r_idx += 1;
+    }
+    let report_ws = workbook.add_worksheet();
+    report_ws.set_name(&report_name)?;
+    render_diagnosis_report_sheet(report_ws, results, &fmt)?;
 
     workbook.save(output_path)?;
     Ok(())

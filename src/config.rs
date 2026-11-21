@@ -1,7 +1,8 @@
 //! 勤務シフト自動生成システム 設定モジュール (`config.rs`)
 //!
-//! Version: v1.3.5
-//! Updated: 2026-11-17 - v1.3.5 特別枠（堀さん：必要に応じて週5）の超過出勤ペナルティ引き上げ (150k -> 10M)
+//! Version: v2.0.0
+//! Updated: 2026-11-21 - v2.0.0 厳格探索＋緩和選択モデルへの刷新（Tier 2重み逆転解消・未使用定数削除・RelaxationKind/Proposal追加・診断用重み整理）
+//! - v1.3.5 (2026-11-17): 特別枠（堀さん：必要に応じて週5）の超過出勤ペナルティ引き上げ (150k -> 10M)
 //! - v1.3.1 (2026-11-10): Stage 2 所定勤務日数防衛重み (WEIGHT_TARGET_DAYS_SLACK=25M) および連勤上限緊急緩和重み (WEIGHT_CONSEC_WORK_SLACK=28M) 追加
 //! - v1.3.0 (2026-11-08): 2階裏職種バランス・Ope推奨・石橋さん水曜公休・早上がり重複回避＆フルタイム増員ペナルティ定数追加
 //! - v1.2.0 (2026-11-01): 全15設定項目・全固定ペナルティ重みの完全連動 (HIGH1推奨重み 10.2M 微調整で一般セクションブレ幅スラック 10M より上位を確定)
@@ -97,64 +98,167 @@ pub fn get_rec_weight(level: &str) -> i64 {
 }
 
 // ============================================================================
-// 2.3 システム固定ペナルティ定数
+// 2.3 システム固定ペナルティ定数（Tier 2 品質最適化 & 承認緩和最小化）
 // ============================================================================
-/// `AND` 固定公休スタッフの所定日数不足防止・石橋さん必須出勤/週4防衛（最優先防衛）
-pub const WEIGHT_FIXED_OFF_SHORTAGE: i64 = 30_000_000;
-/// Stage 2: 連勤上限日数超過に対する緊急緩和スラック（未生成クラッシュ回避用）
-pub const WEIGHT_CONSEC_WORK_SLACK: i64 = 28_000_000;
-/// Stage 2: コアスタッフ・パートの月間所定勤務日数 (`target_days`) 不一致防衛スラック（推奨条件やセクションブレ幅による所定日数崩壊を防止）
-pub const WEIGHT_TARGET_DAYS_SLACK: i64 = 25_000_000;
-/// Stage 2: 2階裏 最低人数不足スラック
-pub const WEIGHT_2F_BACK_MIN_SLACK: i64 = 20_000_000;
-/// Stage 2: 2階裏 職種別（看護師・検査）および曜日・Ope日ハード制約の不足スラック
-pub const WEIGHT_2F_BACK_ROLE_MIN_SLACK: i64 = 18_000_000;
-/// Stage 2: 2階裏 看護師最低人数不足スラック
-pub const WEIGHT_NURSE_DEFICIT_SLACK: i64 = 15_000_000;
-/// Stage 2 / 非常時: 石橋さんの非Ope・非注射週における水曜公休緩和スラック
+/// 承認済み緩和が複数日・週にまたがる場合に必要最小限の使用へ抑える内部ペナルティ
+pub const WEIGHT_APPROVED_RELAX_PENALTY: i64 = 50_000_000;
+/// 承認時/非常時: 条件付水曜公休（非Ope・非注射週）を緩和して水曜出勤させた場合のペナルティ
 pub const WEIGHT_ISHIBASHI_WED_OFF_SLACK: i64 = 14_000_000;
-/// Stage 2: 一般セクション最低不足・最大超過スラック
+/// 承認時/非常時: 「必要に応じて週5」スタッフの所定超過出勤1日あたりペナルティ
+pub const WEIGHT_SPECIAL_EXTRA_WORK: i64 = 10_000_000;
+/// 一般セクション（1階・2階表）の許容ブレ幅逸脱ペナルティ
 pub const WEIGHT_GENERAL_SEC_SLACK: i64 = 10_000_000;
-/// 週4日×固定1日スタッフの第2公休曜日スライド抑制ペナルティ（5週ある月等の暦日数不整合時のみStage 1で最小限許容）
+/// 週4日×固定1日スタッフの第2公休曜日スライド抑制ペナルティ
 pub const WEIGHT_SECOND_OFF_SLIDE_SLACK: i64 = 8_500_000;
-/// Stage 2: 祝日週の最低1日公休（最大出勤日数）超過スラック
-pub const WEIGHT_SUBSTITUTE_OFF_SLACK: i64 = 8_000_000;
-/// `AND` 固定公休スタッフの所定勤務日数 (`target_days`) 未達ペナルティ（早上がり重複補填 5.4M より上位、祝日振替休 8M より下位）
-pub const WEIGHT_FIXED_OFF_UNDER_TARGET: i64 = 7_000_000;
-/// Stage 2: 2階裏 通常週の4名体制日数不足スラック
-pub const WEIGHT_2F_BACK_WEEKLY_4_SLACK: i64 = 5_000_000;
-/// 非Ope日に早上がりスタッフ（長谷川・石橋）が重複した際のフルタイム増員（+1名）不足ペナルティ
-pub const WEIGHT_EARLY_OVERLAP_FULLTIME_SLACK: i64 = 5_000_000;
-/// Ope日の2階裏推奨体制（石橋さん以外に看護師2人＋検査2人＝計4人）不足ペナルティ
-pub const WEIGHT_OPE_2F_BACK_REC_PENALTY: i64 = 3_500_000;
+/// ① Ope日の2階裏推奨体制（Ope専従者以外に看護師2人＋検査2人＝計4人）不足ペナルティ（4名枠最優先）
+pub const WEIGHT_OPE_2F_BACK_REC_PENALTY: i64 = 5_500_000;
+/// ② 非Ope日に早上がりスタッフが重複した際のフルタイム増員（+1名）不足ペナルティ
+pub const WEIGHT_EARLY_OVERLAP_FULLTIME_SLACK: i64 = 3_500_000;
+/// ③ 2階裏 通常週（非祝6稼働日）の4名体制最低日数不足ペナルティ
+pub const WEIGHT_2F_BACK_WEEKLY_4_SLACK: i64 = 2_500_000;
 /// 2階裏 5名出勤ペナルティ
 pub const WEIGHT_2F_BACK_5_PENALTY: i64 = 2_000_000;
-/// OR型スタッフの週次主公休曜日スライド許容ペナルティ（HIGH1/HIGH2推奨人数達成時に主公休の一時移動を許容）
+/// OR型スタッフの週次主公休曜日スライド許容ペナルティ（HIGH1/HIGH2推奨人数達成時に一時移動を許容）
 pub const WEIGHT_MAIN_OFF_SLIDE_SLACK: i64 = 2_000_000;
 /// 1階 `M_s >= 6.5` のとき 6名以下となるペナルティ
 pub const WEIGHT_1F_UNDER_7_PENALTY: i64 = 1_500_000;
-/// セクション人数平準化（2乗項）
+/// 祝日週（平日祝日を含む5診療日週）における公休優先配分ソフト重み（所定日数は割り込まない）
+pub const WEIGHT_HOLIDAY_WEEK_OFF_PREF: i64 = 600_000;
+/// 一般セクション（1階・2階表）人数平準化（2乗項）
 pub const WEIGHT_SEC_BALANCE_SQ: i64 = 500_000;
-/// セクション人数平準化（平均 `round(M_s)` からの絶対誤差）
+/// 一般セクション（1階・2階表）人数平準化（平均 `round(M_s)` からの絶対誤差）
 pub const WEIGHT_SEC_BALANCE_ABS: i64 = 500_000;
-/// 非Ope日に早上がりスタッフ（長谷川・石橋）が同時出勤する重複回避ペナルティ（ソフト制約）
+/// 非Ope日に早上がりスタッフが同時出勤する重複回避ペナルティ（ソフト制約）
 pub const WEIGHT_EARLY_OVERLAP_PENALTY: i64 = 400_000;
 /// 主公休曜日以外の平日に「公」が入る不一致ペナルティ
 pub const WEIGHT_MAIN_OFF_MISMATCH: i64 = 300_000;
-/// 2階裏 3名出勤ペナルティ
-pub const WEIGHT_2F_BACK_3_PENALTY: i64 = 300_000;
 /// カレンダー週（ISO週）単位の公休日数平準化ペナルティ
 pub const WEIGHT_WEEKLY_OFF_DIFF: i64 = 300_000;
 /// 前月主公休継続ペナルティ基準値
 pub const WEIGHT_PREV_OFF_REPEAT: i64 = 300_000;
-/// 2階裏 看護師が推奨人数未満の日のペナルティ
+/// 2階裏 非Ope日の看護師が推奨人数未満の日のペナルティ
 pub const WEIGHT_NURSE_LT2_PENALTY: i64 = 200_000;
-/// 「必要に応じて週5」スタッフの所定超過出勤1日あたりペナルティ（通常時は週4を維持し、2階裏最低人数や職種別必須人数が回らない非常時のみ週5化）
-pub const WEIGHT_SPECIAL_EXTRA_WORK: i64 = 10_000_000;
 /// 7日間ローリング週休平準化ペナルティ
 pub const WEIGHT_ROLLING_WINDOW_DIFF: i64 = 80_000;
-/// 月末3日間の公休偏り抑制ペナルティ
+/// 2階裏 軽い平準化ペナルティ（3〜4名枠を奪わないよう抑制）
+pub const WEIGHT_2F_BACK_SOFT_BALANCE: i64 = 50_000;
+/// 月末3稼働日の公休偏り抑制ペナルティ
 pub const WEIGHT_TAIL_OFF_SUM: i64 = 30_000;
+
+// ============================================================================
+// 2.3b 診断専用 MILP スラック重み定数（Tier 0 は絶対ロック・Tier 1 最小緩和探索用）
+// ============================================================================
+/// 最終手段：所定勤務日数 ±1日調整スラック重み
+pub const DIAG_WEIGHT_TARGET_DAYS_ADJUST: i64 = 200_000_000;
+/// Ope専従スタッフの Ope/注射日必須出勤緩和スラック重み
+pub const DIAG_WEIGHT_OPE_DEDICATED: i64 = 90_000_000;
+/// 固定公休曜日の振替/解除スラック重み
+pub const DIAG_WEIGHT_FIXED_OFF_SWAP: i64 = 60_000_000;
+/// 2階裏 日次総人数最低不足スラック重み
+pub const DIAG_WEIGHT_2F_BACK_MIN: i64 = 45_000_000;
+/// 2階裏 職種別（看護師・検査）最低不足スラック重み
+pub const DIAG_WEIGHT_2F_BACK_ROLE: i64 = 40_000_000;
+/// 週4祝日非連動スタッフの週次目標柔軟化スラック重み
+pub const DIAG_WEIGHT_WEEKLY_FLEX: i64 = 25_000_000;
+/// 非Ope・非注射週における条件付水曜公休の振替スラック重み
+pub const DIAG_WEIGHT_CONDITIONAL_WED_OFF: i64 = 20_000_000;
+/// 特別枠（必要に応じて週5）の超過出勤スラック重み
+pub const DIAG_WEIGHT_SPECIAL_EXTRA_WORK: i64 = 15_000_000;
+
+// ============================================================================
+// 2.3c 承認制緩和モデル定義 (RelaxationScope / RelaxationKind / RelaxationProposal)
+// ============================================================================
+/// 緩和適用スコープ
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum RelaxationScope {
+    /// 特定の日（1..=days_in_month）のみ
+    Day(u32),
+    /// 特定のISOカレンダー週（week_index）のみ
+    Week(usize),
+    /// 当月全体
+    Month,
+}
+
+impl RelaxationScope {
+    /// 指定日・週がこのスコープに含まれるか判定
+    pub fn matches(&self, day: u32, week_index: usize) -> bool {
+        match *self {
+            RelaxationScope::Day(d) => d == day,
+            RelaxationScope::Week(w) => w == week_index,
+            RelaxationScope::Month => true,
+        }
+    }
+}
+
+/// ユーザーが承認して適用する緩和条件の種類
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum RelaxationKind {
+    /// 「必要に応じて週5」特別枠スタッフの週5出勤許可
+    SpecialExtraWork {
+        staff_name: String,
+        scope: RelaxationScope,
+    },
+    /// 条件付水曜公休（非Ope・非注射週）の他曜日振替許可
+    ConditionalWedOff {
+        staff_name: String,
+        scope: RelaxationScope,
+    },
+    /// 2階裏（外来）日次総人数最低ラインの引き下げ許容
+    Sec2fBackMinTotal {
+        scope: RelaxationScope,
+        relaxed_min: i32,
+    },
+    /// 2階裏（外来）看護師最低ラインの引き下げ許容
+    Sec2fBackMinNurse {
+        scope: RelaxationScope,
+        relaxed_min: i32,
+    },
+    /// 2階裏（外来）検査スタッフ最低ラインの引き下げ許容
+    Sec2fBackMinExam {
+        scope: RelaxationScope,
+        relaxed_min: i32,
+    },
+    /// Ope専従スタッフのOpe・注射日必須出勤の免除許容
+    OpeDedicatedWork {
+        staff_name: String,
+        scope: RelaxationScope,
+    },
+    /// 固定公休曜日の振替/出勤許可
+    FixedOffDaySwap {
+        staff_name: String,
+        scope: RelaxationScope,
+    },
+    /// 週4祝日非連動スタッフの特定週出勤日数目標の柔軟化（±1日）
+    WeeklyTargetFlex {
+        staff_name: String,
+        week_index: usize,
+    },
+    /// シフト制約条件シートの HARD ルール緩和
+    SheetHardRule {
+        rule_index: usize,
+        rule_label: String,
+        scope: RelaxationScope,
+    },
+    /// 最終手段：月間所定勤務日数の ±1日調整（delta<0: 減算許容, delta>0: 増加許容, delta==0: ±1許容）
+    TargetDaysAdjust {
+        staff_name: Option<String>,
+        delta: i32,
+    },
+}
+
+/// ユーザーに提示する緩和候補アイテム
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelaxationProposal {
+    pub kind: RelaxationKind,
+    /// GUI/CLIで表示する分かりやすい項目名
+    pub label: String,
+    /// この緩和を選んだ場合の影響説明
+    pub impact_desc: String,
+    /// システムが最小緩和として推奨する候補か
+    pub recommended: bool,
+    /// 最終手段（所定勤務日数±1日調整等）か
+    pub is_last_resort: bool,
+}
 
 /// 3連休抑制レベル重みマップ
 pub fn get_consecutive_off_weight(level: &str) -> i64 {
@@ -193,7 +297,7 @@ pub struct ShiftConfig {
     pub nurse_rec_count: i32,
     /// 4. 連勤上限日数 (初期値: 5)
     pub max_consecutive_work_days: usize,
-    /// 5. 固定公休 削減許容日数 (初期値: 2)
+    /// 5. 固定公休 削減許容日数 (初期値: 2 ※v2.0.0では旧Excel互換読込のみ保持。所定割れ黙認には未使用)
     pub fixed_off_shortage_allowance: i32,
     /// 6. 3連休抑制レベル (初期値: "中")
     pub consecutive_off_level: String,
@@ -388,6 +492,8 @@ mod tests {
         assert_eq!(get_rec_weight("HIGH2"), 4_000_000);
         assert!(get_rec_weight("HIGH1") > WEIGHT_GENERAL_SEC_SLACK);
         assert!(get_rec_weight("HIGH1") > get_level_weight("HIGH2"));
+        assert!(WEIGHT_OPE_2F_BACK_REC_PENALTY > WEIGHT_EARLY_OVERLAP_FULLTIME_SLACK);
+        assert!(WEIGHT_EARLY_OVERLAP_FULLTIME_SLACK > WEIGHT_2F_BACK_WEEKLY_4_SLACK);
         assert_eq!(get_rec_weight("SOFT2"), 200_000);
         assert_eq!(get_rec_weight("LOW"), 50_000);
     }

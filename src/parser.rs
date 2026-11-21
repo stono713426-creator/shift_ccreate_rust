@@ -1,7 +1,8 @@
 //! 勤務シフト自動生成システム Excelデータ解析・日付パーサー (`parser.rs`)
 //!
-//! Version: v1.3.3
-//! Updated: 2026-11-17 - v1.3.3 手術種別4種整理（Vit,cat→vit扱い）および「作成対象」列・判定の廃止
+//! Version: v2.0.0
+//! Updated: 2026-11-21 - v2.0.0 個別勤務ルール属性列対応・pattern NFKC正規化・PM半休誤マッチ修正・未知適用条件エラー検出・重複制約自動整理
+//! - v1.3.3 (2026-11-17): 手術種別4種整理（Vit,cat→vit扱い）および「作成対象」列・判定の廃止
 //! - v1.3.2 (2026-11-10): Excel単体日付セル（2/15等）の対象月年解決対応（2月15日自動変換時の年不一致による反映漏れ修正）
 //! - v1.3.1 (2026-11-10): 入力検証・防御的パース強化（重複スタッフ排除・和暦対応・存在しない日付[9/31等]の警告検出・未知スタッフ名警告・対象月自動補完）
 //! - v1.3.0 (2026-11-08): 「勤務形態」列・既存「職種」列からの職種(看護師/検査)判定、手術スケジュール「注射日」vs「Ope日」分離判定、PM有休(午後/半休)日付抽出対応
@@ -47,6 +48,18 @@ pub struct Staff {
     /// 午後（PM）有休・半休等があらかじめ設定されている日付集合（土曜2人勤務許容判定用）
     #[serde(default)]
     pub pm_leave_dates: HashSet<NaiveDate>,
+    /// 個別勤務属性：早上がりスタッフ（非Ope日の同時出勤抑制＆フルタイム増員対象）
+    #[serde(default)]
+    pub is_early_leave: bool,
+    /// 個別勤務属性：Ope専従（Ope・注射日必須出勤、Ope日の2階裏外来カウント除外）
+    #[serde(default)]
+    pub is_ope_dedicated: bool,
+    /// 個別勤務属性：週4日祝日非連動（祝日週でも週4日出勤維持）
+    #[serde(default)]
+    pub is_holiday_independent_week4: bool,
+    /// 個別勤務属性：条件付き水曜公休（非Ope・非注射週は原則水曜公休）
+    #[serde(default)]
+    pub has_conditional_wed_off: bool,
     pub is_core: bool,
     pub is_part_1f: bool,
     pub order: usize,
@@ -150,6 +163,9 @@ pub struct ShiftRule {
     pub val_rec: i32,
     pub val_max: i32,
     pub level: String,
+    /// 適用条件文字列が既知のキーワードに一致しない不正書式であるか
+    #[serde(default)]
+    pub is_invalid_condition: bool,
 }
 
 /// Excel 全シート解析結果
@@ -279,7 +295,7 @@ pub fn parse_date_list_for_months(
             let re_weekday = Regex::new(r"[\(（][月火水木金土日][\)）]").unwrap();
             let cleaned_wday = re_weekday.replace_all(&cleaned_time, "");
             let re_ampm =
-                Regex::new(r"(?i)[\(（]?\s*(?:am|pm|午前|午後|半休|早退|後休|前休)(?:有休|休)?\s*[\)）]?").unwrap();
+                Regex::new(r"(?i)[\(（]?\s*(?:am|pm|午前|午後|半休|早退|後休|前休)(?:半休|有休|休)?\s*[\)）]?").unwrap();
             let cleaned = re_ampm.replace_all(&cleaned_wday, "");
 
             // 記号 [,、;・\n\r]+ でトークン分割
@@ -301,7 +317,7 @@ pub fn parse_date_list_for_months(
     filter_holidays_sundays(dates, holidays_jp_dict)
 }
 
-/// セル文字列から「午後（PM）有休・半休・早退」指定が付いた日付のみを抽出する
+/// セル文字列から「午後（PM）有休・半休・後休」指定が付いた日付のみを抽出する
 pub fn parse_pm_dates_for_months(
     cell: &Data,
     default_year: i32,
@@ -320,11 +336,12 @@ pub fn parse_pm_dates_for_months(
     }
 
     let re_split = Regex::new(r"[,、;・\n\r]+").unwrap();
-    let re_pm_marker = Regex::new(r"(?i)(?:pm|午後|半休|早退|後休)").unwrap();
+    // 単なる「半休」「午前半休」「AM」には反応させず、明示的な午後(PM)半休・早退のみ対象とする
+    let re_pm_marker = Regex::new(r"(?i)(?:pm|午後(?:半休|有休|休)?|後休)").unwrap();
     let re_time = Regex::new(r"\b\d{1,2}:\d{2}(:\d{2})?\b").unwrap();
     let re_weekday = Regex::new(r"[\(（][月火水木金土日][\)）]").unwrap();
     let re_ampm =
-        Regex::new(r"(?i)[\(（]?\s*(?:am|pm|午前|午後|半休|早退|後休|前休)(?:有休|休)?\s*[\)）]?").unwrap();
+        Regex::new(r"(?i)[\(（]?\s*(?:am|pm|午前|午後|半休|早退|後休|前休)(?:半休|有休|休)?\s*[\)）]?").unwrap();
 
     for seg in re_split.split(trimmed) {
         let seg_trim = seg.trim();
@@ -680,9 +697,15 @@ pub fn parse_shift_excel<P: AsRef<Path>>(
         }
     }
 
-    // 4.1 制約ルールの対象スタッフ名チェック（タイポ・未登録名検知）
+    // 4.1 制約ルールの対象スタッフ名チェック・適用条件書式検証・重複/無効ルール整理
     if !all_known_staff_names.is_empty() {
         for rule in &rules {
+            if rule.is_invalid_condition {
+                parse_warnings.push(format!(
+                    "❌ [制約条件エラー] シフト制約条件『{}』の適用条件『{}』が認識できない書式です（有効例: 全日 / 月曜〜土曜 / 手術のある日 / 火曜(OPE日) / 「Vit」手術日 / 注射日）。",
+                    rule.name, rule.condition_desc
+                ));
+            }
             for target_name in &rule.target_staffs {
                 if !all_known_staff_names.contains(target_name) {
                     parse_warnings.push(format!(
@@ -692,7 +715,77 @@ pub fn parse_shift_excel<P: AsRef<Path>>(
                 }
             }
         }
+    } else {
+        for rule in &rules {
+            if rule.is_invalid_condition {
+                parse_warnings.push(format!(
+                    "❌ [制約条件エラー] シフト制約条件『{}』の適用条件『{}』が認識できない書式です。",
+                    rule.name, rule.condition_desc
+                ));
+            }
+        }
     }
+
+    // 4.2 標準2階裏ルールとの重複除去および残1名「全日」必須ルールの整理
+    let active_staff_map: HashMap<&str, &Staff> = staffs
+        .iter()
+        .filter(|s| s.pattern != "除外")
+        .map(|s| (s.name.as_str(), s))
+        .collect();
+    let mut cleaned_rules = Vec::with_capacity(rules.len());
+    for rule in rules {
+        if rule.is_invalid_condition {
+            cleaned_rules.push(rule);
+            continue;
+        }
+        let valid_refs: Vec<&Staff> = rule
+            .target_staffs
+            .iter()
+            .filter_map(|n| active_staff_map.get(n.as_str()).copied())
+            .collect();
+
+        if valid_refs.is_empty() {
+            continue;
+        }
+
+        let desc_trim = rule.condition_desc.trim();
+        let is_general_ope_cond = desc_trim == "日曜日以外の手術のある日" || desc_trim == "手術のある日";
+        let all_2f_back = valid_refs.iter().all(|s| s.section == "2階裏");
+        let all_ope_ded = valid_refs.iter().all(|s| s.is_ope_dedicated);
+        let all_non_ded_nurse = valid_refs
+            .iter()
+            .all(|s| s.is_nurse() && !s.is_ope_dedicated);
+
+        // 旧フォーマットに残存する2階裏Ope重複ルール（石橋 / 江原・堀）の二重適用防止
+        let is_dup_2f_ope_rule = is_general_ope_cond
+            && all_2f_back
+            && ((all_ope_ded && rule.val_min <= 1 && rule.val_rec <= 1)
+                || (all_non_ded_nurse && rule.val_min <= 1 && rule.val_rec <= 2));
+        if is_dup_2f_ope_rule {
+            parse_warnings.push(format!(
+                "ℹ️ [重複制約の自動整理] シフト制約条件『{}: {} ({})』はシステム標準の2階裏ルールと重複するため、標準ルールへ一本化しました。",
+                rule.name,
+                rule.condition_desc,
+                rule.target_staffs.join(",")
+            ));
+            continue;
+        }
+
+        // 除外等で有効スタッフが1名しか残らず「全日」最低1名以上必須となるルールは成立不能のため警告して除外
+        if desc_trim.contains("全日") && valid_refs.len() == 1 && rule.val_min >= 1 {
+            parse_warnings.push(format!(
+                "⚠️ [制約対象不足警告] シフト制約条件『{}: {} ({})』は除外等により有効対象スタッフが1名（{}）のみとなったため、全日出勤必須ルールを自動無効化しました。",
+                rule.name,
+                rule.condition_desc,
+                rule.target_staffs.join(","),
+                valid_refs[0].name
+            ));
+            continue;
+        }
+
+        cleaned_rules.push(rule);
+    }
+    rules = cleaned_rules;
 
     // 5. 前月実績シートの探索とパース
     let mut prev_month_main_offs = HashMap::new();
@@ -933,12 +1026,19 @@ fn parse_staff_sheet(
     let mut col_preferred_off = None;
     let mut col_specified_off = None;
     let mut col_exclude = None;
+    let mut col_special_rules = None;
     let mut header_row_idx = 0;
 
     for (r_idx, row) in rows.iter().enumerate().take(5) {
         for (c_idx, cell) in row.iter().enumerate() {
             let s = cell.to_string().trim().to_string();
-            if s.contains("除外") {
+            if s.contains("個別勤務ルール")
+                || s.contains("個別ルール")
+                || s.contains("特記ルール")
+                || s.contains("勤務属性")
+            {
+                col_special_rules = Some(c_idx);
+            } else if s.contains("除外") {
                 col_exclude = Some(c_idx);
             } else if s.contains("氏名") || s.contains("名前") || s.contains("スタッフ") {
                 col_name = Some(c_idx);
@@ -1069,7 +1169,11 @@ fn parse_staff_sheet(
             String::new()
         };
 
-        let pattern = col_pattern.and_then(|c| row.get(c)).map(|d| d.to_string().trim().to_string()).unwrap_or_default();
+        let raw_pattern = col_pattern
+            .and_then(|c| row.get(c))
+            .map(|d| d.to_string().trim().to_string())
+            .unwrap_or_default();
+        let pattern: String = raw_pattern.nfkc().collect::<String>().trim().to_string();
 
         let basic_off_str = col_basic_off.and_then(|c| row.get(c)).map(|d| d.to_string().trim().to_string()).unwrap_or_default();
 
@@ -1148,6 +1252,53 @@ fn parse_staff_sheet(
             }
         }
 
+        // 個別勤務ルール属性の抽出（属性列優先、未記入時は旧フォーマット互換の氏名フォールバック）
+        let raw_special_rules = col_special_rules
+            .and_then(|c| row.get(c))
+            .map(|d| d.to_string().nfkc().collect::<String>().trim().to_string())
+            .unwrap_or_default();
+
+        let (
+            is_early_leave,
+            is_ope_dedicated,
+            is_holiday_independent_week4,
+            has_conditional_wed_off,
+        ) = if raw_special_rules.is_empty() {
+            // 後方互換フォールバック
+            if name == "石橋" {
+                (true, true, true, true)
+            } else if name == "長谷川" {
+                (true, false, false, false)
+            } else {
+                (false, false, false, false)
+            }
+        } else if matches!(
+            raw_special_rules.as_str(),
+            "なし" | "無" | "解除" | "無効" | "-" | "－"
+        ) {
+            (false, false, false, false)
+        } else {
+            let sr_lower = raw_special_rules.to_lowercase();
+            let early = raw_special_rules.contains("早上がり")
+                || raw_special_rules.contains("時短重複");
+            let ope_ded = sr_lower.contains("ope専従")
+                || raw_special_rules.contains("オペ専従")
+                || raw_special_rules.contains("手術専従");
+            let w4_ind = raw_special_rules.contains("週4祝日非連動")
+                || raw_special_rules.contains("祝日非連動");
+            let wed_off = sr_lower.contains("非ope水曜公休")
+                || raw_special_rules.contains("条件付水曜公休")
+                || raw_special_rules.contains("条件付き水曜公休")
+                || raw_special_rules.contains("水曜公休");
+
+            if !early && !ope_ded && !w4_ind && !wed_off {
+                parse_warnings.push(format!(
+                    "⚠️ [個別勤務ルール警告] スタッフ『{name}』の個別勤務ルール『{raw_special_rules}』に認識できるキーワード（早上がり / Ope専従 / 週4祝日非連動 / 非Ope水曜公休）が含まれていません。"
+                ));
+            }
+            (early, ope_ded, w4_ind, wed_off)
+        };
+
         let mut staff = Staff {
             name,
             section,
@@ -1163,6 +1314,10 @@ fn parse_staff_sheet(
             preferred_off_dates,
             specified_off_dates,
             pm_leave_dates,
+            is_early_leave,
+            is_ope_dedicated,
+            is_holiday_independent_week4,
+            has_conditional_wed_off,
             is_core,
             is_part_1f,
             order: r_idx,
@@ -1231,6 +1386,31 @@ fn cell_to_i32(cell: &Data) -> Option<i32> {
         }
         _ => None,
     }
+}
+
+/// シフト制約条件の適用条件文字列が既知の有効書式であるかを検証する
+pub fn validate_rule_condition_desc(desc: &str) -> bool {
+    let norm: String = desc.nfkc().collect();
+    let trimmed = norm.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let re_nth = Regex::new(r"第[1-5一二三四五]").unwrap();
+    if re_nth.is_match(trimmed) {
+        return false;
+    }
+    if trimmed.contains("日曜") && !trimmed.contains("日曜日以外") {
+        return false;
+    }
+    let lower = trimmed.to_lowercase();
+    trimmed.contains("全日")
+        || trimmed.contains("注射")
+        || trimmed.contains("手術")
+        || lower.contains("ope")
+        || trimmed.contains("オペ")
+        || ["月曜", "火曜", "水曜", "木曜", "金曜", "土曜"]
+            .iter()
+            .any(|w| trimmed.contains(w))
 }
 
 /// シフト制約条件シートのパース
@@ -1315,6 +1495,7 @@ fn parse_rules_sheet(range: &Range<Data>, rules: &mut Vec<ShiftRule>) {
         let val_rec = col_rec.and_then(|c| row.get(c)).and_then(cell_to_i32).unwrap_or(0);
         let val_max = col_max.and_then(|c| row.get(c)).and_then(cell_to_i32).unwrap_or(99);
         let level = col_level.and_then(|c| row.get(c)).map(|d| d.to_string().trim().to_string()).unwrap_or_else(|| "SOFT".to_string());
+        let is_invalid_condition = !validate_rule_condition_desc(&condition_desc);
 
         rules.push(ShiftRule {
             name,
@@ -1326,6 +1507,7 @@ fn parse_rules_sheet(range: &Range<Data>, rules: &mut Vec<ShiftRule>) {
             val_rec,
             val_max,
             level,
+            is_invalid_condition,
         });
     }
 }
@@ -1646,6 +1828,10 @@ mod tests {
             preferred_off_dates: HashSet::new(),
             specified_off_dates: HashSet::new(),
             pm_leave_dates: HashSet::new(),
+            is_early_leave: false,
+            is_ope_dedicated: false,
+            is_holiday_independent_week4: false,
+            has_conditional_wed_off: false,
             is_core: true,
             is_part_1f: false,
             order: 1,
@@ -1719,5 +1905,31 @@ mod tests {
         assert_eq!(normalize_ope_type_text("gla"), "gla");
         assert_eq!(normalize_ope_type_text("下垂"), "下垂");
         assert_eq!(normalize_ope_type_text("Vit,cat, 注射"), "vit,注射");
+    }
+
+    #[test]
+    fn test_v2_pm_strict_and_rule_condition_validation() {
+        // 午前半休や単なる「半休」には反応せず、PM/午後/午後半休/後休のみ抽出されること
+        let cell = Data::String("9/12(午前半休), 9/14(半休), 9/19(午後半休), 9/26(PM)".to_string());
+        let all_dates = parse_date_list_for_months(&cell, 2026, &[], None);
+        assert_eq!(all_dates.len(), 4);
+        let pm_dates = parse_pm_dates_for_months(&cell, 2026, &[], None);
+        assert_eq!(pm_dates.len(), 2);
+        assert!(!pm_dates.contains(&NaiveDate::from_ymd_opt(2026, 9, 12).unwrap()));
+        assert!(!pm_dates.contains(&NaiveDate::from_ymd_opt(2026, 9, 14).unwrap()));
+        assert!(pm_dates.contains(&NaiveDate::from_ymd_opt(2026, 9, 19).unwrap()));
+        assert!(pm_dates.contains(&NaiveDate::from_ymd_opt(2026, 9, 26).unwrap()));
+
+        // 適用条件の書式検証
+        assert!(validate_rule_condition_desc("全日"));
+        assert!(validate_rule_condition_desc("火曜(OPE日)"));
+        assert!(validate_rule_condition_desc("火曜・水曜"));
+        assert!(validate_rule_condition_desc("「Vit」手術日"));
+        assert!(validate_rule_condition_desc("注射日"));
+        assert!(!validate_rule_condition_desc("月末"));
+        assert!(!validate_rule_condition_desc("第1金曜"));
+        assert!(!validate_rule_condition_desc("金"));
+        assert!(!validate_rule_condition_desc("月燿"));
+        assert!(!validate_rule_condition_desc(""));
     }
 }

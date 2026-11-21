@@ -1,7 +1,8 @@
 //! 勤務シフト自動生成システム 統合回帰テストスイート (`tests/regression_suite.rs`)
 //!
-//! Version: v1.3.5
-//! Updated: 2026-11-17 - v1.3.5 2階裏の日次最低出勤人数（有休1名まで減算なし・2名以上減算）、堀さん週4基準維持・非常時のみ週5化、職種別隠れ必須人数の事前診断検証追加
+//! Version: v2.0.0
+//! Updated: 2026-11-21 - v2.0.0 厳格探索・適切解なし診断＆承認緩和フロー・バグ修正(除外/同時休み/未知条件/PM厳格化/属性列/共通休診⚠️除外/生成診断レポート)の統合検証対応
+//! - v1.3.5 (2026-11-17): 2階裏の日次最低出勤人数（有休1名まで減算なし・2名以上減算）、堀さん週4基準維持・非常時のみ週5化、職種別隠れ必須人数の事前診断検証追加
 //! - v1.3.4 (2026-11-17): vit（およびVit,cat）がシフト条件上でcatと同一扱いになることの検証追加
 //! - v1.3.3 (2026-11-17): test_16 手術種別4種統一（Vit,cat→vit扱い）＆新ひな形「作成対象」列廃止検証追加
 //! - v1.3.2 (2026-11-10): test_15 Excel単体日付セル（2/15→2026-02-15シリアル値）の翌年補完＆2027年2月ソルブ反映検証追加
@@ -23,14 +24,17 @@
 
 use calamine::{open_workbook_auto, Reader};
 use chrono::{Datelike, NaiveDate};
-use shift_core::generator::{GenerateOptions, ShiftGenerator};
+use shift_core::config::{RelaxationKind, RelaxationScope};
+use shift_core::generator::{GenerateOptions, MonthStepOutcome, ShiftGenerationSession, ShiftGenerator};
 use shift_core::holidays::{calculate_japanese_holidays, get_holidays};
 use shift_core::parser::{
     excel_serial_to_date, parse_date_list, parse_date_list_for_months, parse_shift_excel,
     ParsedExcelData,
 };
 use shift_core::renderer::render_shifts_to_file;
-use shift_core::solver::{parse_rule_target_dates, solve_shift, MonthContext};
+use shift_core::solver::{
+    parse_rule_target_dates, solve_shift, solve_shift_with_relaxations, MonthContext, SolveStatus,
+};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -195,26 +199,37 @@ fn test_03_substitute_off_in_holiday_week() {
 }
 
 // ============================================================================
-// 4. test_04_holiday_week_min_1_off: 祝日を含む診療日5日週のコアスタッフ最大4日出勤検証
+// 4. test_04_holiday_week_min_1_off: 祝日週の所定勤務日数最優先および合理的公休配分検証
 // ============================================================================
 #[test]
 fn test_04_holiday_week_min_1_off() {
     let (parsed, holidays) = load_test_excel();
-    let res = solve_shift(&parsed, 2026, 9, &holidays);
-    assert!(res.success, "シフト生成が成功すること");
+    // 2027年2月 (2/11木・2/23火が平日祝日)
+    let res = solve_shift(&parsed, 2027, 2, &holidays);
+    assert!(res.success && res.stage == 1, "2027年2月が厳格条件で成功すること");
 
-    let ctx = MonthContext::new(2026, 9, &holidays);
+    let ctx = MonthContext::new(2027, 2, &holidays);
+    // 全コアスタッフの月間所定勤務日数が100%厳守されていること
+    assert!(
+        res.audit.target_mismatches.is_empty(),
+        "所定勤務日数不一致がないこと: {:?}",
+        res.audit.target_mismatches
+    );
 
-    // 祝日を含み、診療日数が5日以下の週において、全コアスタッフが出勤日数 <= 4 (最低1日公休) であること
+    // 平日祝日5診療日週において、固定公休曜日が祝日に当たらないORスタッフは公休を1日以上確保していること
     for week in &ctx.weeks {
-        if week.has_holiday && week.clinic_days.len() == 5 {
+        if week.has_weekday_holiday && week.clinic_days.len() == 5 {
             for staff in &parsed.staffs {
-                if staff.is_core && staff.pattern != "除外" {
+                if staff.is_core
+                    && staff.pattern != "除外"
+                    && staff.basic_off_type == shift_core::parser::OffType::Or
+                {
                     let staff_shifts = &res.shifts[&staff.name];
-                    let week_work_cnt: u32 = week.clinic_days.iter().map(|d| staff_shifts[d] as u32).sum();
+                    let week_work_cnt: u32 =
+                        week.clinic_days.iter().map(|d| staff_shifts[d] as u32).sum();
                     assert!(
                         week_work_cnt <= 4,
-                        "スタッフ [{}] は祝日週 (week {}) において最大4日出勤であること (実出勤: {}日)",
+                        "ORスタッフ [{}] は平日祝日週 (week {}) で公休が優先配分されていること (実出勤: {}日)",
                         staff.name,
                         week.week_index,
                         week_work_cnt
@@ -237,21 +252,27 @@ fn test_05_weekly_balance_and_2f_back_4staff() {
     let ctx = MonthContext::new(2026, 9, &holidays);
 
     // 通常週（祝日を含まない6診療日週: 第2週 9/7〜9/12 など）において
-    // 2階裏コアスタッフの出勤数が 4名以上となる日が最低 2日以上存在すること
-    let core_2f_back_names: Vec<String> = parsed
+    // 2階裏（外来：Ope日のOpe専従者除く）コアスタッフの出勤数が 4名以上となる日が最低 2日以上存在すること
+    let core_2f_back: Vec<&shift_core::parser::Staff> = parsed
         .staffs
         .iter()
-        .filter(|s| s.section == "2階裏" && s.is_core && s.pattern != "除外")
-        .map(|s| s.name.clone())
+        .filter(|s| {
+            s.section == "2階裏"
+                && (s.is_core || s.is_holiday_independent_week4 || s.is_ope_dedicated)
+                && s.pattern != "除外"
+        })
         .collect();
 
     for week in &ctx.weeks {
         if !week.has_holiday && week.clinic_days.len() == 6 {
             let mut days_with_4plus = 0;
             for &d in &week.clinic_days {
-                let cnt: u32 = core_2f_back_names
+                let dt = ctx.date_map[&d];
+                let is_ope = shift_core::parser::is_ope_date(&parsed.ope_dict, &dt);
+                let cnt: u32 = core_2f_back
                     .iter()
-                    .map(|name| res.shifts[name][&d] as u32)
+                    .filter(|s| !(is_ope && s.is_ope_dedicated))
+                    .map(|s| res.shifts[&s.name][&d] as u32)
                     .sum();
                 if cnt >= 4 {
                     days_with_4plus += 1;
@@ -275,7 +296,8 @@ fn test_05_weekly_balance_and_2f_back_4staff() {
 fn test_06_prev_month_linking() {
     let (mut parsed, holidays) = load_test_excel();
 
-    // 榊原さんの前月末尾実績として 4連勤 (8/28〜8/31 が出勤: 1, 1, 1, 1) を設定
+    // 榊原さんの前月末尾実績として 4連勤 (2026年8月末 8/28〜8/31 が出勤: 1, 1, 1, 1) を設定
+    parsed.prev_sheet_year_month = Some((2026, 8));
     parsed
         .prev_month_tail_shifts
         .insert("榊原".to_string(), vec![1, 1, 1, 1]);
@@ -378,6 +400,11 @@ fn test_08_renderer_excel_output() {
         "シート名 '2026年09月シフト' が存在すること: {:?}",
         sheet_names
     );
+    assert!(
+        sheet_names.contains(&"生成診断レポート".to_string()),
+        "シート名 '生成診断レポート' が末尾に存在すること: {:?}",
+        sheet_names
+    );
 
     let range = workbook
         .worksheet_range("2026年09月シフト")
@@ -450,6 +477,7 @@ fn test_09_multi_month_continuous_generation() {
     let options = GenerateOptions {
         target_months: Some(test_months),
         output_path: Some(out_path.clone()),
+        ..Default::default()
     };
 
     let mut log_count = 0;
@@ -506,9 +534,31 @@ fn test_10_kojima_november_special_vacation() {
         "11/16 が小島さんの指定公休に含まれていること"
     );
 
-    // 2. 2026年11月シフト生成
-    let res = solve_shift(&parsed, 2026, 11, &holidays);
-    assert!(res.success, "2026年11月のシフト生成が成功すること");
+    // 2. 2026年11月シフト生成（小島さん全休週を含むため厳格探索では適切解なしとなり、推奨緩和承認後に成功すること）
+    let res_strict = solve_shift(&parsed, 2026, 11, &holidays);
+    assert!(
+        !res_strict.success && res_strict.status == SolveStatus::Infeasible,
+        "2026年11月は小島さん全休週の検査不足等により無緩和では適切解なし(Infeasible)と明示されること"
+    );
+    let diag = res_strict
+        .diagnosis
+        .as_ref()
+        .expect("適切解なし時に診断結果が付与されること");
+    assert!(!diag.tier0_unsolvable, "緩和候補により解決可能であること");
+    let rec_relax: HashSet<RelaxationKind> = diag
+        .proposals
+        .iter()
+        .filter(|p| p.recommended)
+        .map(|p| p.kind.clone())
+        .collect();
+    assert!(!rec_relax.is_empty(), "推奨緩和候補が1件以上提示されること");
+
+    let res = solve_shift_with_relaxations(&parsed, 2026, 11, &holidays, &rec_relax);
+    assert!(
+        res.success && res.stage == 2,
+        "推奨緩和を承認して再実行すると2026年11月のシフト生成が成功すること: {:?}",
+        res.logs
+    );
 
     let kojima_shifts = res.shifts.get("小島").expect("小島さんのシフトが存在すること");
     for d in 17..=21 {
@@ -655,6 +705,7 @@ fn test_11_friday_high1_and_rule_priority_v1_1_0() {
     let options = GenerateOptions {
         target_months: Some(vec![(2027, 1), (2027, 2), (2027, 3)]),
         output_path: Some(out_path.clone()),
+        ..Default::default()
     };
 
     let (_, results) =
@@ -780,12 +831,11 @@ fn test_12_full_spec_audit_v1_2_0() {
     assert!(res_sp.success && res_sp.stage == 1, "Stage 1 で解けること");
     let hori_target = res_sp.target_days["堀"];
     let hori_actual: i32 = res_sp.shifts["堀"].values().map(|&v| v as i32).sum();
-    assert!(
-        hori_actual >= hori_target && hori_actual <= hori_target + 5,
-        "堀さんの出勤日数 ({}) が [target={}, target+5={}] の範囲内であること",
+    assert_eq!(
+        hori_actual, hori_target,
+        "v2.0.0: 通常月は承認なしでは堀さんの出勤日数 ({}) が週4基準の所定日数 ({}) 通りであること",
         hori_actual,
-        hori_target,
-        hori_target + 5
+        hori_target
     );
     let ishi_target = res_sp.target_days["石橋"];
     let ishi_actual: i32 = res_sp.shifts["石橋"].values().map(|&v| v as i32).sum();
@@ -806,13 +856,17 @@ fn test_12_full_spec_audit_v1_2_0() {
         }
     }
 
-    // 4. 2階裏_基本人数 (sec_2f_back_base_cap = 3) の日次最低人数確保検証（v1.3.4t: 有休1名までは減算せず3名維持、2名以上は減算）
+    // 4. 2階裏_基本人数 (sec_2f_back_base_cap = 3) の日次最低人数確保検証（有休1名までは減算せず3名維持、2名以上は減算）
     let res_sep = solve_shift(&parsed, 2026, 9, &holidays);
     assert!(res_sep.success && res_sep.stage == 1);
     let core_2f_b: Vec<&shift_core::parser::Staff> = parsed
         .staffs
         .iter()
-        .filter(|s| s.section == "2階裏" && s.is_core && s.pattern != "除外")
+        .filter(|s| {
+            s.section == "2階裏"
+                && (s.is_core || s.is_holiday_independent_week4 || s.is_ope_dedicated)
+                && s.pattern != "除外"
+        })
         .collect();
     for &d in &ctx_sep.clinic_days {
         let dt = ctx_sep.date_map[&d];
@@ -820,30 +874,18 @@ fn test_12_full_spec_audit_v1_2_0() {
         let vac_cnt = core_2f_b
             .iter()
             .filter(|s| {
-                !(is_ope && s.name == "石橋")
+                !(is_ope && s.is_ope_dedicated)
                     && (s.vacation_dates.contains(&dt)
                         || s.special_vacation_dates.contains(&dt)
                         || s.preferred_off_dates.contains(&dt)
                         || s.specified_off_dates.contains(&dt))
             })
             .count() as i32;
-        let avail_cnt = core_2f_b
-            .iter()
-            .filter(|s| {
-                !(is_ope && s.name == "石橋")
-                    && !s.vacation_dates.contains(&dt)
-                    && !s.special_vacation_dates.contains(&dt)
-                    && !s.preferred_off_dates.contains(&dt)
-                    && !s.specified_off_dates.contains(&dt)
-            })
-            .count() as i32;
         let vac_deduct = if is_ope { 0 } else { (vac_cnt - 1).max(0) };
-        let expected_min = (parsed.config.sec_2f_back_base_cap - vac_deduct)
-            .min(avail_cnt)
-            .max(0) as u32;
+        let expected_min = (parsed.config.sec_2f_back_base_cap - vac_deduct).max(0) as u32;
         let actual_2f_b: u32 = core_2f_b
             .iter()
-            .filter(|s| !(is_ope && s.name == "石橋"))
+            .filter(|s| !(is_ope && s.is_ope_dedicated))
             .map(|s| res_sep.shifts[&s.name][&d] as u32)
             .sum();
         assert!(
@@ -855,15 +897,34 @@ fn test_12_full_spec_audit_v1_2_0() {
         );
     }
 
-    // 5. 過去最大3ヶ月分の主公休ローテーション検証 (2ヶ月周期ピンポンの防止)
+    // 5. 過去最大3ヶ月分の主公休ローテーション検証 (2026/11の推奨緩和を事前承認した4ヶ月連続生成)
+    let diag_nov_res = solve_shift(&parsed, 2026, 11, &holidays);
+    assert!(!diag_nov_res.success && diag_nov_res.status == SolveStatus::Infeasible);
+    let rec_nov: HashSet<RelaxationKind> = diag_nov_res
+        .diagnosis
+        .as_ref()
+        .unwrap()
+        .proposals
+        .iter()
+        .filter(|p| p.recommended)
+        .map(|p| p.kind.clone())
+        .collect();
+    let mut approved_map = HashMap::new();
+    approved_map.insert((2026, 11), rec_nov);
+
     let out_rot = PathBuf::from("target/test_v1_2_0_rot4m.xlsx");
     let _ = fs::remove_file(&out_rot);
     let rot_opts = GenerateOptions {
         target_months: Some(vec![(2026, 9), (2026, 10), (2026, 11), (2026, 12)]),
         output_path: Some(out_rot.clone()),
+        approved_relaxations_by_month: approved_map,
     };
     let (_, rot_results) = ShiftGenerator::generate(&parsed, &holidays, &rot_opts, |_, _, _, _, _| {})
         .expect("4ヶ月連続生成が成功すること");
+    assert!(
+        rot_results.iter().all(|(_, _, r)| r.success),
+        "承認済み緩和を含め4ヶ月すべて成功すること"
+    );
     let miyazawa_offs: Vec<u32> = rot_results
         .iter()
         .map(|(_, _, r)| r.main_offs["宮澤"])
@@ -889,6 +950,7 @@ fn test_12_full_spec_audit_v1_2_0() {
     let guard_opts_sep = GenerateOptions {
         target_months: Some(vec![(2026, 9)]),
         output_path: Some(out_guard.clone()),
+        ..Default::default()
     };
     let (_, sep_guard_res) =
         ShiftGenerator::generate(&guard_parsed, &holidays, &guard_opts_sep, |_, _, _, _, _| {})
@@ -899,6 +961,7 @@ fn test_12_full_spec_audit_v1_2_0() {
     let guard_opts_jan = GenerateOptions {
         target_months: Some(vec![(2027, 1)]),
         output_path: Some(out_guard.clone()),
+        ..Default::default()
     };
     let (_, jan_guard_res) =
         ShiftGenerator::generate(&guard_parsed, &holidays, &guard_opts_jan, |_, _, _, _, _| {})
@@ -923,7 +986,7 @@ fn test_12_full_spec_audit_v1_2_0() {
         !parsed.staffs.iter().any(|s| s.name == "高橋" || s.name == "森川"),
         "除外フラグ=True のスタッフ（高橋・森川）が除外されていること"
     );
-    assert_eq!(parsed.rules.len(), 12, "標準ひな形のシフト制約条件が12件であること");
+    assert_eq!(parsed.rules.len(), 9, "標準ひな形のシフト制約条件が重複整理後の9件であること");
 }
 
 // ============================================================================
@@ -1030,8 +1093,19 @@ fn test_13_v1_3_0_2f_back_and_ishibashi_rules() {
     }
 
     // (d) 祝日がある5診療日週（例: 2026年11月 第2週 11/2〜11/7 [11/3文化の日]、第5週 11/23〜11/28 [11/23勤労感謝の日]）でも週4日出勤を維持すること
-    let res_nov = solve_shift(&parsed, 2026, 11, &holidays);
-    assert!(res_nov.success && res_nov.stage == 1, "2026年11月が Stage 1 で解けること");
+    let res_nov_strict = solve_shift(&parsed, 2026, 11, &holidays);
+    assert!(!res_nov_strict.success && res_nov_strict.status == SolveStatus::Infeasible);
+    let rec_nov_for_13: HashSet<RelaxationKind> = res_nov_strict
+        .diagnosis
+        .as_ref()
+        .unwrap()
+        .proposals
+        .iter()
+        .filter(|p| p.recommended)
+        .map(|p| p.kind.clone())
+        .collect();
+    let res_nov = solve_shift_with_relaxations(&parsed, 2026, 11, &holidays, &rec_nov_for_13);
+    assert!(res_nov.success && res_nov.stage == 2, "2026年11月が推奨緩和承認で解けること");
     let ctx_nov = MonthContext::new(2026, 11, &holidays);
     for week in &ctx_nov.weeks {
         if week.has_holiday && week.clinic_days.len() == 5 {
@@ -1054,7 +1128,11 @@ fn test_13_v1_3_0_2f_back_and_ishibashi_rules() {
     let core_2f_b: Vec<&shift_core::parser::Staff> = custom_parsed
         .staffs
         .iter()
-        .filter(|s| s.section == "2階裏" && s.is_core && s.pattern != "除外")
+        .filter(|s| {
+            s.section == "2階裏"
+                && (s.is_core || s.is_holiday_independent_week4 || s.is_ope_dedicated)
+                && s.pattern != "除外"
+        })
         .collect();
 
     for &d in &ctx_sep.clinic_days {
@@ -1139,19 +1217,126 @@ fn test_13_v1_3_0_2f_back_and_ishibashi_rules() {
             );
         }
 
-        // 3-3(2): 非Ope日に長谷川さんと石橋さんが同時出勤している場合、フルタイムが2人以上（外来計4人以上）配置されていること
-        if !is_ope && res_custom.shifts["長谷川"][&d] == 1 && res_custom.shifts["石橋"][&d] == 1 {
-            let ft_cnt: u32 = out_members
+    }
+
+    // 3-3(2): 非Ope日に長谷川さんと石橋さんが重複出勤している場合、Ope推奨(5.5M)優先下でも可能な日はフルタイム2名以上（外来計4名以上）が増員配置されること
+    // (※8日ものOpe＋2日の注射日を詰め込んだ custom_parsed では看護師総数30日 < 全推奨33日となるため過半数の重複日でFT+1達成を確認し、通常負荷月での全達成も別途検証)
+    let overlap_non_ope_days: Vec<u32> = ctx_sep
+        .clinic_days
+        .iter()
+        .copied()
+        .filter(|&d| {
+            let dt = ctx_sep.date_map[&d];
+            !is_ope_date(&custom_parsed.ope_dict, &dt)
+                && res_custom.shifts["長谷川"][&d] == 1
+                && res_custom.shifts["石橋"][&d] == 1
+        })
+        .collect();
+    if !overlap_non_ope_days.is_empty() {
+        let fulfilled_overlap = overlap_non_ope_days
+            .iter()
+            .filter(|&&d| {
+                let ft_cnt: u32 = core_2f_b
+                    .iter()
+                    .filter(|s| !s.is_early_leave)
+                    .map(|s| res_custom.shifts[&s.name][&d] as u32)
+                    .sum();
+                let tot_cnt: u32 = core_2f_b
+                    .iter()
+                    .map(|s| res_custom.shifts[&s.name][&d] as u32)
+                    .sum();
+                ft_cnt >= 2 && tot_cnt >= 4
+            })
+            .count();
+        assert!(
+            fulfilled_overlap * 2 >= overlap_non_ope_days.len(),
+            "過密Ope月でも非Ope早上がり重複日の過半数でFT増員(4名以上)が確保されること ({fulfilled_overlap}/{})",
+            overlap_non_ope_days.len()
+        );
+    }
+
+    // 通常負荷の9月（ひな形そのまま）の 4-A 優先順検証:
+    // 2階裏4名枠（月8枠）に対し ① Ope推奨(5.5M) > ② 非Ope早上がり重複FT+1(3.5M) で優先配分されること
+    let res_norm_sep = solve_shift(&parsed, 2026, 9, &holidays);
+    assert!(res_norm_sep.success && res_norm_sep.stage == 1);
+    let mut non_tue_ope_4_ok = 0usize;
+    let mut non_tue_ope_total = 0usize;
+    let mut norm_overlap_ok = 0usize;
+    let mut norm_overlap_total = 0usize;
+    for &d in &ctx_sep.clinic_days {
+        let dt = ctx_sep.date_map[&d];
+        let w = ctx_sep.weekday_map[&d];
+        let is_ope = is_ope_date(&parsed.ope_dict, &dt);
+        if is_ope && w != 1 {
+            non_tue_ope_total += 1;
+            let ns_cnt: u32 = core_2f_b
                 .iter()
-                .filter(|s| s.name != "長谷川" && s.name != "石橋")
-                .map(|s| res_custom.shifts[&s.name][&d] as u32)
+                .filter(|s| !s.is_ope_dedicated && s.is_nurse())
+                .map(|s| res_norm_sep.shifts[&s.name][&d] as u32)
+                .sum();
+            let ex_cnt: u32 = core_2f_b
+                .iter()
+                .filter(|s| !s.is_ope_dedicated && s.is_exam())
+                .map(|s| res_norm_sep.shifts[&s.name][&d] as u32)
+                .sum();
+            if ns_cnt >= 2 && ex_cnt >= 2 {
+                non_tue_ope_4_ok += 1;
+            }
+        }
+        if !is_ope && res_norm_sep.shifts["長谷川"][&d] == 1 && res_norm_sep.shifts["石橋"][&d] == 1 {
+            norm_overlap_total += 1;
+            let ft_cnt: u32 = core_2f_b
+                .iter()
+                .filter(|s| !s.is_early_leave)
+                .map(|s| res_norm_sep.shifts[&s.name][&d] as u32)
+                .sum();
+            let out_total: u32 = core_2f_b
+                .iter()
+                .map(|s| res_norm_sep.shifts[&s.name][&d] as u32)
+                .sum();
+            if ft_cnt >= 2 && out_total >= 4 {
+                norm_overlap_ok += 1;
+            }
+        }
+    }
+    assert!(
+        non_tue_ope_total > 0 && non_tue_ope_4_ok >= 4,
+        "通常9月の火曜以外Ope日({non_tue_ope_total}日)でOpe推奨(Ns>=2&検>=2)が優先達成されること ({non_tue_ope_4_ok}/{non_tue_ope_total})"
+    );
+    if norm_overlap_total >= 2 {
+        assert!(
+            norm_overlap_ok >= 2,
+            "残余の4名枠が非Ope早上がり重複日に複数日配分されること ({norm_overlap_ok}/{norm_overlap_total})"
+        );
+    }
+
+    // 4名枠に余裕がある月（9月Opeを2日のみ残した場合）では、全非Ope早上がり重複日で100% フルタイム+1増員（計4名以上）が達成されること
+    let mut low_ope_sep = parsed.clone();
+    low_ope_sep.ope_dict.retain(|dt, _| {
+        !(dt.year() == 2026
+            && dt.month() == 9
+            && !matches!(dt.day(), 2 | 4))
+    });
+    let res_low_ope = solve_shift(&low_ope_sep, 2026, 9, &holidays);
+    assert!(res_low_ope.success && res_low_ope.stage == 1);
+    for &d in &ctx_sep.clinic_days {
+        let dt = ctx_sep.date_map[&d];
+        if !is_ope_date(&low_ope_sep.ope_dict, &dt)
+            && res_low_ope.shifts["長谷川"][&d] == 1
+            && res_low_ope.shifts["石橋"][&d] == 1
+        {
+            let ft_cnt: u32 = core_2f_b
+                .iter()
+                .filter(|s| !s.is_early_leave)
+                .map(|s| res_low_ope.shifts[&s.name][&d] as u32)
+                .sum();
+            let out_total: u32 = core_2f_b
+                .iter()
+                .map(|s| res_low_ope.shifts[&s.name][&d] as u32)
                 .sum();
             assert!(
                 ft_cnt >= 2 && out_total >= 4,
-                "9/{} (非Ope日) に長谷川・石橋が重複出勤した際、フルタイム2名以上（外来計4名以上）が増員配置されていること (ft={}, total={})",
-                d,
-                ft_cnt,
-                out_total
+                "余裕枠月(low_ope_sep)の9/{d} (非Ope日) の早上がり重複時は100% フルタイム2名以上（計4名以上）であること (ft={ft_cnt}, total={out_total})"
             );
         }
     }
@@ -1231,79 +1416,129 @@ fn test_13_v1_3_0_2f_back_and_ishibashi_rules() {
     assert_eq!(sat12_cnt, 2, "9/12(土) の終日出勤人数が2名として許容されること");
 
     // ------------------------------------------------------------------------
-    // 全7ヶ月連続生成（2026年9月〜2027年3月）がすべて Stage 1 (Optimal) で解けることの検証
+    // 全7ヶ月検証: 通常6ヶ月は無緩和厳格 (stage==1)、11月は推奨緩和承認後 (stage==2) で連続生成成功
     // ------------------------------------------------------------------------
+    for &(y, m) in &[(2026, 9), (2026, 10), (2026, 12), (2027, 1), (2027, 2), (2027, 3)] {
+        let r = solve_shift(&parsed, y, m, &holidays);
+        assert!(
+            r.success && r.stage == 1,
+            "通常月 {}年{:02}月が無緩和・厳格条件 (stage=1) で解けること: {:?}",
+            y, m, r.logs
+        );
+    }
+
+    let mut approved_map_7m = HashMap::new();
+    approved_map_7m.insert((2026, 11), rec_nov_for_13);
+
     let out_7m = PathBuf::from("target/test_v1_3_0_all_7months.xlsx");
     let _ = fs::remove_file(&out_7m);
     let opts_7m = GenerateOptions {
         target_months: None, // ひな形の全対象月 (2026/09〜2027/03)
         output_path: Some(out_7m.clone()),
+        approved_relaxations_by_month: approved_map_7m,
     };
     let (_, results_7m) = ShiftGenerator::generate(&parsed, &holidays, &opts_7m, |_, _, _, _, _| {})
         .expect("全7ヶ月連続生成に成功すること");
     assert_eq!(results_7m.len(), 7);
     for (y, m, r) in &results_7m {
+        let expected_stage = if *y == 2026 && *m == 11 { 2 } else { 1 };
         assert!(
-            r.success && r.stage == 1,
-            "{}年{:02}月 が Stage 1 (厳格探索) で最適解を得られること (stage={})",
+            r.success && r.stage == expected_stage,
+            "{}年{:02}月 が期待通り stage={} で完了すること (actual stage={}, success={})",
             y,
             m,
-            r.stage
+            expected_stage,
+            r.stage,
+            r.success
         );
     }
     let _ = fs::remove_file(&out_7m);
 }
 
 // ============================================================================
-// 14. test_14_v1_3_1_conflict_and_crash_prevention:
-//     v1.3.1 Category 1 & Category 2 ソルバー破綻（INFEASIBLE）および重み逆転防止の検証
+// 14. test_14_v2_0_0_strict_stop_and_diagnosis:
+//     v2.0.0 厳格停止（「適切解なし」明示・無断緩和廃止）・原因診断＆推奨緩和提案の検証
 // ============================================================================
 #[test]
 fn test_14_v1_3_1_conflict_and_crash_prevention() {
     let (parsed, holidays) = load_test_excel();
 
     // ------------------------------------------------------------------------
-    // ケース1 (Category 1):
-    //   - 石橋さんの前月末尾シフトが5連勤 [1,1,1,1,1] かつ 当月1日(9/1)が Ope日（必須出勤）
+    // ケース1a (Tier 0 物理矛盾・緩和不可):
     //   - 非コアスタッフ（後藤さん）の基本公休が空欄（週6稼働設定）で連勤上限(5日)と衝突する設定
+    //   -> v2.0.0: 無断連勤スキップせず Tier 0 競合 (tier0_unsolvable=true) で停止すること
     // ------------------------------------------------------------------------
-    let mut case1 = parsed.clone();
-    case1
-        .prev_month_tail_shifts
-        .insert("石橋".to_string(), vec![0, 0, 1, 1, 1, 1, 1]);
-    case1
-        .ope_dict
-        .insert(NaiveDate::from_ymd_opt(2026, 9, 1).unwrap(), "Vit,cat".to_string());
-    let goto = case1
+    let mut case1a = parsed.clone();
+    let goto = case1a
         .staffs
         .iter_mut()
         .find(|s| s.name == "後藤")
         .expect("ひな形に後藤さんが存在すること");
     goto.basic_off_days.clear();
-    let res1 = solve_shift(&case1, 2026, 9, &holidays);
+    let res1a = solve_shift(&case1a, 2026, 9, &holidays);
     assert!(
-        res1.success && res1.stage == 1,
-        "ケース1（前月5連勤＋1日Ope必須＋非コア週6設定）がクラッシュせず Stage 1 で解けること"
+        !res1a.success && res1a.status == SolveStatus::Infeasible,
+        "ケース1a（非コア週6設定）は安易な連勤スキップを行わず適切解なしとなること"
     );
-    assert_eq!(res1.shifts["石橋"][&1], 1, "石橋さんが 9/1(Ope日) に出勤できていること");
-    // 後藤さんが月内で5連勤上限を守っていること
-    let mut goto_streak = 0;
-    for d in 1..=30 {
-        if res1.shifts["後藤"][&d] == 1 {
-            goto_streak += 1;
-            assert!(goto_streak <= 5, "非コアスタッフ（後藤）も5連勤上限を守っていること");
-        } else {
-            goto_streak = 0;
-        }
-    }
+    let diag1a = res1a.diagnosis.as_ref().expect("診断結果が付与されること");
+    assert!(diag1a.tier0_unsolvable, "非コア連勤競合は tier0_unsolvable=true であること");
+    assert!(
+        diag1a.causes.iter().any(|c| c.category.contains("パート連勤上限競合")),
+        "診断原因に「パート連勤上限競合」が記録されること: {:?}",
+        diag1a.causes
+    );
 
     // ------------------------------------------------------------------------
-    // ケース2 (Category 1):
-    //   - 特別枠（堀さん: is_special）および通常コアスタッフ（小島さん）に大量の希望休（14日分）を設定し、
-    //     従来の所定日数(16日/20日)が物理的出勤可能日数を超過するケース
+    // ケース1b (月跨ぎ連勤 vs Ope必須):
+    //   - 石橋さんの前月末尾シフトが5連勤 [0,0,1,1,1,1,1] かつ 当月1日(9/1)が Ope日（必須出勤）
+    //   -> v2.0.0: 前月実績を改変せず適切解なしとし、「月跨ぎ連勤上限」原因と OpeDedicatedWork(Day(1)) を提案。
+    //      承認後は stage=2 で成功し、9/1は休み(5連勤上限厳守)となること。
     // ------------------------------------------------------------------------
-    let mut case2 = parsed.clone();
-    for st in &mut case2.staffs {
+    let mut case1b = parsed.clone();
+    case1b.prev_sheet_year_month = Some((2026, 8));
+    case1b
+        .prev_month_tail_shifts
+        .insert("石橋".to_string(), vec![0, 0, 1, 1, 1, 1, 1]);
+    case1b
+        .ope_dict
+        .insert(NaiveDate::from_ymd_opt(2026, 9, 1).unwrap(), "Vit,cat".to_string());
+    let res1b_strict = solve_shift(&case1b, 2026, 9, &holidays);
+    assert!(
+        !res1b_strict.success && res1b_strict.status == SolveStatus::Infeasible,
+        "ケース1b（前月5連勤＋1日Ope必須）は前月改変せず厳格に適切解なしとなること"
+    );
+    let diag1b = res1b_strict.diagnosis.as_ref().expect("診断結果が付与されること");
+    assert!(
+        diag1b.causes.iter().any(|c| c.category.contains("月跨ぎ連勤上限")),
+        "原因に「月跨ぎ連勤上限」が含まれること: {:?}",
+        diag1b.causes
+    );
+    let expected_relax_1b = RelaxationKind::OpeDedicatedWork {
+        staff_name: "石橋".to_string(),
+        scope: RelaxationScope::Day(1),
+    };
+    assert!(
+        diag1b.proposals.iter().any(|p| p.kind == expected_relax_1b),
+        "緩和提案に 9/1 Ope必須免除が含まれること: {:?}",
+        diag1b.proposals
+    );
+    let mut app_1b = HashSet::new();
+    app_1b.insert(expected_relax_1b);
+    let res1b_relaxed = solve_shift_with_relaxations(&case1b, 2026, 9, &holidays, &app_1b);
+    assert!(
+        res1b_relaxed.success && res1b_relaxed.stage == 2,
+        "Ope必須免除承認後は stage=2 で成功すること: {:?}",
+        res1b_relaxed.logs
+    );
+    assert_eq!(res1b_relaxed.shifts["石橋"][&1], 0, "連勤上限(5日)により9/1は休みであること");
+
+    // ------------------------------------------------------------------------
+    // ケース2 (希望休超過 -> 無断クランプ廃止 & 最終手段 TargetDaysAdjust):
+    //   - 2a: 大量希望休（14日超） -> target無断クランプせず Infeasible & 個人出勤上限不足原因
+    //   - 2b: 小島さんの希望休を増やして所定勤務日数より1日だけ出勤不能にする -> TargetDaysAdjust(-1日) 提案＆承認で成功
+    // ------------------------------------------------------------------------
+    let mut case2a = parsed.clone();
+    for st in &mut case2a.staffs {
         if st.name == "堀" || st.name == "小島" {
             for d in 1..=18 {
                 if let Some(dt) = NaiveDate::from_ymd_opt(2026, 9, d) {
@@ -1312,22 +1547,64 @@ fn test_14_v1_3_1_conflict_and_crash_prevention() {
             }
         }
     }
-    let res2 = solve_shift(&case2, 2026, 9, &holidays);
+    let res2a = solve_shift(&case2a, 2026, 9, &holidays);
     assert!(
-        res2.success,
-        "ケース2（堀さん・小島さんに大量の希望休設定）でも INFEASIBLE クラッシュせず解けること"
+        !res2a.success && res2a.status == SolveStatus::Infeasible,
+        "ケース2a（大量希望休）は無断クランプせず適切解なしとなること"
     );
+    let diag2a = res2a.diagnosis.as_ref().unwrap();
     assert!(
-        res2.target_days["堀"] <= 12 && res2.target_days["小島"] <= 12,
-        "希望休超過時に target_days が物理的最大出勤可能日数以下に自動クランプされること: 堀={}, 小島={}",
-        res2.target_days["堀"],
-        res2.target_days["小島"]
+        diag2a.causes.iter().any(|c| c.category.contains("個人出勤上限不足")),
+        "原因に「個人出勤上限不足」が含まれること: {:?}",
+        diag2a.causes
+    );
+
+    // 2b: 小島さん(9月稼働可能21日, target=19日)に対し、連勤休みが入らない週(9/5土, 9/26土, 9/28月)に3日希望休を与えて
+    // 最大出勤可能日数をちょうど18日 (< target=19日: 1日だけ不足) とする -> TargetDaysAdjust(-1日) 提案＆承認で成功すること
+    let mut case2b = parsed.clone();
+    if let Some(kojima) = case2b.staffs.iter_mut().find(|s| s.name == "小島") {
+        for d in [5u32, 26, 28] {
+            kojima
+                .preferred_off_dates
+                .insert(NaiveDate::from_ymd_opt(2026, 9, d).unwrap());
+        }
+    }
+    let res2b = solve_shift(&case2b, 2026, 9, &holidays);
+    assert!(!res2b.success && res2b.status == SolveStatus::Infeasible);
+    let diag2b = res2b.diagnosis.as_ref().unwrap();
+    assert!(!diag2b.tier0_unsolvable, "±1日以内の不足はTargetDaysAdjustで救済提案可能なこと");
+    let has_target_adj = diag2b.proposals.iter().any(|p| {
+        p.is_last_resort
+            && matches!(
+                p.kind,
+                RelaxationKind::TargetDaysAdjust {
+                    staff_name: Some(ref n),
+                    delta: -1
+                } if n == "小島"
+            )
+    });
+    assert!(
+        has_target_adj,
+        "小島さんの所定日数-1日調整が最終手段として提案されること: {:?}",
+        diag2b.proposals
+    );
+    let app_2b: HashSet<RelaxationKind> = diag2b
+        .proposals
+        .iter()
+        .filter(|p| p.recommended)
+        .map(|p| p.kind.clone())
+        .collect();
+    let res2b_ok = solve_shift_with_relaxations(&case2b, 2026, 9, &holidays, &app_2b);
+    assert!(
+        res2b_ok.success && res2b_ok.stage == 2,
+        "推奨緩和承認後に解けること: {:?}",
+        res2b_ok.logs
     );
 
     // ------------------------------------------------------------------------
-    // ケース3 (Category 1 & 2):
+    // ケース3:
     //   - 同一週（9/7月〜9/12土の6日間すべて）に Ope日が6日連続で設定された極端ケース
-    //     （石橋さんのOpe必須6日 vs 5連勤上限、および2階裏検査スタッフ2名必須×6日 vs 週5日上限）
+    //   -> v2.0.0: 厳格探索では破綻として明示停止し、推奨緩和承認後に5連勤上限を守って解けること
     // ------------------------------------------------------------------------
     let mut case3 = parsed.clone();
     for d in 7..=12 {
@@ -1335,15 +1612,26 @@ fn test_14_v1_3_1_conflict_and_crash_prevention() {
             .ope_dict
             .insert(NaiveDate::from_ymd_opt(2026, 9, d).unwrap(), "Vit,cat".to_string());
     }
-    let res3 = solve_shift(&case3, 2026, 9, &holidays);
+    let res3_strict = solve_shift(&case3, 2026, 9, &holidays);
     assert!(
-        res3.success && res3.stage == 1,
-        "ケース3（週6日すべてOpe日の極端な週）でも供給量ガードにより Stage 1 で破綻せず解けること (success={}, stage={}, logs={:?})",
-        res3.success,
-        res3.stage,
-        res3.logs
+        !res3_strict.success && res3_strict.status == SolveStatus::Infeasible,
+        "ケース3（週6日Ope）は厳格探索で適切解なしとなること"
     );
-    let ishi_w1_sum: u32 = (7..=12).map(|d| res3.shifts["石橋"][&d] as u32).sum();
+    let diag3 = res3_strict.diagnosis.as_ref().unwrap();
+    assert!(!diag3.tier0_unsolvable && !diag3.proposals.is_empty());
+    let app_3: HashSet<RelaxationKind> = diag3
+        .proposals
+        .iter()
+        .filter(|p| p.recommended)
+        .map(|p| p.kind.clone())
+        .collect();
+    let res3_ok = solve_shift_with_relaxations(&case3, 2026, 9, &holidays, &app_3);
+    assert!(
+        res3_ok.success && res3_ok.stage == 2,
+        "ケース3の推奨緩和承認後は成功すること: {:?}",
+        res3_ok.logs
+    );
+    let ishi_w1_sum: u32 = (7..=12).map(|d| res3_ok.shifts["石橋"][&d] as u32).sum();
     assert!(
         ishi_w1_sum <= 5,
         "週6日Opeがあっても石橋さんの5連勤上限が守られること (w1_sum={})",
@@ -1351,9 +1639,9 @@ fn test_14_v1_3_1_conflict_and_crash_prevention() {
     );
 
     // ------------------------------------------------------------------------
-    // ケース4 (Category 2):
-    //   - df_rules の HARD ペア（田中島,梶原：全日最低1名）の片方（田中島さん）が1週間（9/7月〜9/12土）丸ごと有休を取得し、
-    //     もう片方（梶原さん）が6連勤を強制されそうになるケース
+    // ケース4:
+    //   - df_rules の HARD ペア（田中島,梶原：全日最低1名）の片方（田中島さん）が1週間（9/7月〜9/12土）丸ごと有休
+    //   -> v2.0.0: 厳格探索で適切解なし＆SheetHardRule緩和候補提示、承認後に梶原さん5連勤上限厳守で解決すること
     // ------------------------------------------------------------------------
     let mut case4 = parsed.clone();
     if let Some(st) = case4.staffs.iter_mut().find(|s| s.name == "田中島") {
@@ -1362,23 +1650,40 @@ fn test_14_v1_3_1_conflict_and_crash_prevention() {
                 .insert(NaiveDate::from_ymd_opt(2026, 9, d).unwrap());
         }
     }
-    let res4 = solve_shift(&case4, 2026, 9, &holidays);
+    let res4_strict = solve_shift(&case4, 2026, 9, &holidays);
     assert!(
-        res4.success && res4.stage == 1,
-        "ケース4（HARDペアの片方が1週間全休）でも連勤上限と衝突せず Stage 1 で解けること"
+        !res4_strict.success && res4_strict.status == SolveStatus::Infeasible,
+        "ケース4（HARDペア片方1週間全休）は厳格探索で適切解なしとなること"
     );
-    let kaji_w1_sum: u32 = (7..=12).map(|d| res4.shifts["梶原"][&d] as u32).sum();
+    let diag4 = res4_strict.diagnosis.as_ref().unwrap();
+    assert!(
+        diag4.proposals.iter().any(|p| matches!(p.kind, RelaxationKind::SheetHardRule { .. })),
+        "緩和候補に SheetHardRule が含まれること: {:?}",
+        diag4.proposals
+    );
+    let app_4: HashSet<RelaxationKind> = diag4
+        .proposals
+        .iter()
+        .filter(|p| p.recommended)
+        .map(|p| p.kind.clone())
+        .collect();
+    let res4_ok = solve_shift_with_relaxations(&case4, 2026, 9, &holidays, &app_4);
+    assert!(
+        res4_ok.success && res4_ok.stage == 2,
+        "ケース4の推奨緩和承認後は成功すること: {:?}",
+        res4_ok.logs
+    );
+    let kaji_w1_sum: u32 = (7..=12).map(|d| res4_ok.shifts["梶原"][&d] as u32).sum();
     assert_eq!(
         kaji_w1_sum, 5,
         "相方が1週間全休のとき、梶原さんは連勤上限(5日)まで出勤して1日公休を確保すること"
     );
 
     // ------------------------------------------------------------------------
-    // ケース5 (Category 3):
-    //   - 標準ひな形で誤警告が出ないこと（除外スタッフの高橋・森川を含むルールでも警告0件）
-    //   - 和暦（令和8年9月15日, R8/9/18）の日付パースが正常に動作すること
+    // ケース5:
+    //   - 標準ひな形で誤警告が出ないこと
+    //   - 和暦（令和8年9月15日, R8/9/18）の日付パース
     //   - MonthContext::new に異常月（month=99）が渡されてもパニックせず安全にクランプされること
-    //   - 事前診断ログ（⚠️ [事前診断]）がケース1・ケース3の SolveResult.logs に記録されていること
     // ------------------------------------------------------------------------
     assert!(
         parsed.parse_warnings.is_empty(),
@@ -1393,15 +1698,6 @@ fn test_14_v1_3_1_conflict_and_crash_prevention() {
 
     let safe_ctx = MonthContext::new(2026, 99, &holidays);
     assert_eq!(safe_ctx.month, 12, "異常な月(99)でもパニックせず 12月にクランプされること");
-
-    assert!(
-        res1.logs.iter().any(|l| l.contains("⚠️ [事前診断]")),
-        "ケース1で事前診断ログが出力されていること"
-    );
-    assert!(
-        res3.logs.iter().any(|l| l.contains("⚠️ [事前診断]")),
-        "ケース3で事前診断ログが出力されていること"
-    );
 }
 
 // ============================================================================
@@ -1666,6 +1962,378 @@ fn test_17_v1_3_4t_no_2f_back_vac_auto_deduction() {
     assert_eq!(
         res.shifts["石橋"][&2], 0,
         "9/2(水) は2名有休により最低人数が2名へ減算されるため、石橋さんの非Ope水曜公休(0)も維持されること"
+    );
+}
+
+// ============================================================================
+// 18. test_18_v2_0_0_comprehensive_verification:
+//     v2.0.0 全面改修の網羅的検証（実務7ヶ月検証・セッション停止＆再試行・全バグ修正・旧互換・レポート）
+// ============================================================================
+#[test]
+fn test_18_v2_0_0_comprehensive_verification() {
+    use rust_xlsxwriter::Workbook as WxWorkbook;
+    use shift_core::parser::{parse_pm_dates_for_months, Staff};
+
+    let (parsed, holidays) = load_test_excel();
+
+    // ------------------------------------------------------------------------
+    // 1. 通常6ヶ月（2026/09, 10, 12, 2027/01, 02, 03）連続セッション検証
+    //    - 全月 stage==1 (厳格達成)
+    //    - 全スタッフ target_mismatches 空
+    //    - 2027年3月の小田切(22/22)・長谷川(22/22, 火曜5回中1回振替, <=5連勤)
+    //    - 全通常6ヶ月で堀さんが厳格週4維持
+    // ------------------------------------------------------------------------
+    let mut sess = ShiftGenerationSession::new(
+        &parsed,
+        &holidays,
+        &GenerateOptions {
+            target_months: None,
+            output_path: Some(PathBuf::from("target/test_v2_0_0_full7m.xlsx")),
+            ..Default::default()
+        },
+    )
+    .expect("セッション作成成功");
+
+    let mut solved_map: HashMap<(i32, u32), shift_core::solver::SolveResult> = HashMap::new();
+    let mut paused_nov_diag = None;
+
+    while let Some((cy, cm)) = sess.current_month() {
+        match sess.solve_current_month(&HashSet::new(), |_, _, _, _, _| {}) {
+            MonthStepOutcome::Solved { year, month, result, .. } => {
+                assert_ne!((year, month), (2026, 11), "2026/11 は無緩和では停止すること");
+                assert_eq!(result.stage, 1, "{year}年{month}月は無緩和 stage=1 であること");
+                assert!(
+                    result.audit.target_mismatches.is_empty(),
+                    "{year}年{month}月で所定勤務日数不一致がないこと: {:?}",
+                    result.audit.target_mismatches
+                );
+                let h_tgt = result.target_days["堀"];
+                let h_act: i32 = result.shifts["堀"].values().map(|&v| v as i32).sum();
+                assert_eq!(h_act, h_tgt, "{year}年{month}月で堀さんが厳格週4({h_tgt}日)維持");
+                solved_map.insert((year, month), result);
+            }
+            MonthStepOutcome::NeedsRelaxation { year, month, result } => {
+                assert_eq!((year, month), (2026, 11), "一時停止は2026/11のみであること: ({year},{month})");
+                let diag = result.diagnosis.clone().expect("診断結果があること");
+                assert!(!diag.tier0_unsolvable);
+                paused_nov_diag = Some(diag.clone());
+
+                // 推奨候補を承認して再試行 -> stage == 2 で成功＆次月12月へ引き継ぐ
+                let rec: HashSet<RelaxationKind> = diag
+                    .proposals
+                    .iter()
+                    .filter(|p| p.recommended)
+                    .map(|p| p.kind.clone())
+                    .collect();
+                assert!(!rec.is_empty());
+                match sess.solve_current_month(&rec, |_, _, _, _, _| {}) {
+                    MonthStepOutcome::Solved {
+                        year: ry,
+                        month: rm,
+                        result: rres,
+                        ..
+                    } => {
+                        assert_eq!((ry, rm), (2026, 11));
+                        assert_eq!(rres.stage, 2);
+                        assert!(
+                            rres.audit.target_mismatches.is_empty(),
+                            "11月も承認緩和後は全コア所定日数一致: {:?}",
+                            rres.audit.target_mismatches
+                        );
+                        solved_map.insert((ry, rm), rres);
+                    }
+                    other => panic!("11月の推奨緩和再試行が失敗: {:?}", matches!(other, MonthStepOutcome::AllDone)),
+                }
+            }
+            MonthStepOutcome::AllDone => break,
+        }
+        let _ = (cy, cm);
+    }
+
+    // 2026年11月診断原因の内容検証（11/17検査0名、11/18・11/20検査不足、第3週供給不足）
+    let nov_diag = paused_nov_diag.expect("2026/11の診断が取得されていること");
+    assert!(
+        nov_diag.causes.iter().any(|c| c.scope_label.contains("11/17") && c.category.contains("検査")),
+        "11/17 検査不足が原因に含まれること: {:?}",
+        nov_diag.causes
+    );
+    assert!(
+        nov_diag.causes.iter().any(|c| c.scope_label.contains("11/18")),
+        "11/18 が原因に含まれること: {:?}",
+        nov_diag.causes
+    );
+    assert!(
+        nov_diag.causes.iter().any(|c| c.scope_label.contains("11/20")),
+        "11/20 が原因に含まれること: {:?}",
+        nov_diag.causes
+    );
+    assert!(
+        nov_diag.causes.iter().any(|c| c.category.contains("週次総供給不足")),
+        "週次総供給不足が原因に含まれること: {:?}",
+        nov_diag.causes
+    );
+
+    // 2027年3月：小田切(22/22)と長谷川(22/22、火曜5回中4休1出勤、<=5連勤)
+    let res_mar = &solved_map[&(2027, 3)];
+    assert_eq!(res_mar.target_days["小田切"], 22);
+    assert_eq!(
+        res_mar.shifts["小田切"].values().map(|&v| v as i32).sum::<i32>(),
+        22,
+        "2027年3月の小田切さんが22/22達成"
+    );
+    assert_eq!(res_mar.target_days["長谷川"], 22);
+    assert_eq!(
+        res_mar.shifts["長谷川"].values().map(|&v| v as i32).sum::<i32>(),
+        22,
+        "2027年3月の長谷川さんが22/22達成"
+    );
+    let mut hase_streak = 0;
+    for d in 1..=31 {
+        if res_mar.shifts["長谷川"][&d] == 1 {
+            hase_streak += 1;
+            assert!(hase_streak <= 5, "長谷川さんが2027/03で5連勤上限厳守");
+        } else {
+            hase_streak = 0;
+        }
+    }
+
+    // Excel出力検証：生成診断レポートシート＆共通休診日(12/29-31, 1/2, 1/4)に⚠️なし
+    let _ = fs::remove_file("target/test_v2_0_0_full7m.xlsx");
+    let (saved_7m, _) = sess.finalize_excel(|_, _, _, _, _| {}).expect("Excel出力成功");
+    let mut wb = open_workbook_auto(&saved_7m).expect("7ヶ月Excel再読込");
+    let names = wb.sheet_names().to_vec();
+    assert_eq!(
+        names.last().map(|s| s.as_str()),
+        Some("生成診断レポート"),
+        "末尾シートが『生成診断レポート』であること: {:?}",
+        names
+    );
+    for (sheet, days) in [("2026年12月シフト", vec![29u32, 30, 31]), ("2027年01月シフト", vec![2u32, 4])] {
+        let range = wb.worksheet_range(sheet).unwrap();
+        let rows: Vec<Vec<calamine::Data>> = range.rows().map(|r| r.to_vec()).collect();
+        for d in days {
+            let warn_cell = rows[(d + 1) as usize][3].to_string();
+            assert_eq!(
+                warn_cell.trim(),
+                "",
+                "{sheet} のクリニック全体休診日 {d}日 に ⚠️ が出ないこと (actual: '{warn_cell}')"
+            );
+        }
+    }
+    let _ = fs::remove_file(&saved_7m);
+
+    // ------------------------------------------------------------------------
+    // 2. バグ修正網羅テスト
+    //    (a) 3名ルールで1名除外時に eff_min = 1 (val_min.min(valid_count)) が有効
+    //    (b) 4名「同時休み不可」val_min=1 が >= 1（3 ではない）で動作
+    //    (c) 未知条件文字列（「月末」「第1金曜」）で tier0_unsolvable=true
+    //    (d) PM有休厳格判定（午前半休・半休は非該当）＆全角「週４日」NFKC正規化
+    //    (e) 旧形式Excel読み込み互換（属性自動推定・重複ルール11/12自動除外）
+    // ------------------------------------------------------------------------
+    let mut mini = parsed.clone();
+    // 高橋・森川は既にロード時除外なので、さらに宮澤を除外して 3名ルール(小島,長谷川,宮澤 など)を作る代わりに
+    // 小型合成データで (a)(b)(c) をピンポイント検証
+    let make_staff = |name: &str| Staff {
+        name: name.to_string(),
+        section: "1階".to_string(),
+        role: "スタッフ".to_string(),
+        employment: "正社員".to_string(),
+        pattern: "週5日".to_string(),
+        basic_off_days: vec![],
+        basic_off_type: shift_core::parser::OffType::Or,
+        is_auto_rotated_off: false,
+        is_core: true,
+        is_special: false,
+        is_early_leave: false,
+        is_ope_dedicated: false,
+        is_holiday_independent_week4: false,
+        has_conditional_wed_off: false,
+        vacation_dates: HashSet::new(),
+        special_vacation_dates: HashSet::new(),
+        preferred_off_dates: HashSet::new(),
+        specified_off_dates: HashSet::new(),
+        pm_leave_dates: HashSet::new(),
+        is_part_1f: false,
+        order: 0,
+    };
+
+    // (a) 3名中1名除外, val_min=1 -> 残2名のうち最低1名必須（他1名を有休にしても残り1名は出勤すること）
+    let mut rule_a_data = parsed.clone();
+    rule_a_data.rules.clear();
+    let mut s_excl = make_staff("除外者A");
+    s_excl.pattern = "除外".to_string();
+    let mut s_vac = make_staff("有休者B");
+    s_vac.vacation_dates.insert(NaiveDate::from_ymd_opt(2026, 9, 1).unwrap());
+    let s_rem = make_staff("出勤者C");
+    rule_a_data.staffs = vec![s_excl, s_vac, s_rem];
+    rule_a_data.rules.push(shift_core::parser::ShiftRule {
+        name: "3名除外テスト".to_string(),
+        condition_desc: "火曜".to_string(),
+        rule_type: String::new(),
+        level: "HARD1".to_string(),
+        target_staffs: vec!["除外者A".to_string(), "有休者B".to_string(), "出勤者C".to_string()],
+        target_dates_desc: String::new(),
+        val_min: 1,
+        val_max: 99,
+        val_rec: 1,
+        is_invalid_condition: false,
+    });
+    let res_a = solve_shift(&rule_a_data, 2026, 9, &holidays);
+    assert!(res_a.success, "3名中1名除外・val_min=1 が解けること");
+    assert_eq!(
+        res_a.shifts["出勤者C"][&1], 1,
+        "バグ修正確認: 除外1名があっても val_min=1 が維持され、有休者B以外の出勤者Cが9/1(火)に必ず出勤すること"
+    );
+
+    // (b) 4名「同時休み不可」 val_min=1: 3人が土曜休み希望でも 1名出勤すれば満たされること（旧式の max(1, 4-1)=3 なら破綻する）
+    let mut rule_b_data = parsed.clone();
+    rule_b_data.rules.clear();
+    let mut s1 = make_staff("四名A");
+    let mut s2 = make_staff("四名B");
+    let mut s3 = make_staff("四名C");
+    let s4 = make_staff("四名D");
+    let sat_sep5 = NaiveDate::from_ymd_opt(2026, 9, 5).unwrap();
+    s1.preferred_off_dates.insert(sat_sep5);
+    s2.preferred_off_dates.insert(sat_sep5);
+    s3.preferred_off_dates.insert(sat_sep5);
+    rule_b_data.staffs = vec![s1, s2, s3, s4];
+    rule_b_data.rules.push(shift_core::parser::ShiftRule {
+        name: "同時休み不可テスト".to_string(),
+        condition_desc: "全日".to_string(),
+        rule_type: String::new(),
+        level: "HARD1".to_string(),
+        target_staffs: vec![
+            "四名A".to_string(),
+            "四名B".to_string(),
+            "四名C".to_string(),
+            "四名D".to_string(),
+        ],
+        target_dates_desc: String::new(),
+        val_min: 1,
+        val_max: 99,
+        val_rec: 1,
+        is_invalid_condition: false,
+    });
+    let res_b = solve_shift(&rule_b_data, 2026, 9, &holidays);
+    assert!(
+        res_b.success && res_b.shifts["四名D"][&5] == 1,
+        "4名同時休み不可(val_min=1)が >=1 で正しく動作すること"
+    );
+
+    // (c) 未知条件文字列（「月末」）-> is_invalid_condition -> tier0_unsolvable=true で即停止
+    mini.rules[0].is_invalid_condition = true;
+    mini.rules[0].condition_desc = "月末".to_string();
+    let res_c = solve_shift(&mini, 2026, 9, &holidays);
+    assert!(!res_c.success && res_c.diagnosis.as_ref().map(|d| d.tier0_unsolvable).unwrap_or(false));
+
+    // (d) PM有休厳格判定
+    let pm_cell = calamine::Data::String("9/12(午前半休), 9/19(半休), 9/26(午後半休)".to_string());
+    let pm_res = parse_pm_dates_for_months(&pm_cell, 2026, &[(2026, 9)], Some(&holidays));
+    assert_eq!(pm_res.len(), 1);
+    assert!(pm_res.contains(&NaiveDate::from_ymd_opt(2026, 9, 26).unwrap()));
+
+    // (e) 旧形式互換Excel（個別勤務ルール列なし + 重複ルール + 全角「週４日」）
+    let legacy_xlsx = PathBuf::from("target/test_v2_0_0_legacy.xlsx");
+    let _ = fs::remove_file(&legacy_xlsx);
+    {
+        let mut wx = WxWorkbook::new();
+        {
+            let ws = wx.add_worksheet();
+            ws.set_name("スタッフマスタ").unwrap();
+            for (c, h) in [
+                "氏名",
+                "所属",
+                "職種",
+                "雇用形態",
+                "基本勤務パターン",
+                "基本公休曜日",
+                "基本公休判定",
+                "除外フラグ",
+            ]
+            .iter()
+            .enumerate()
+            {
+                ws.write_string(0, c as u16, *h).unwrap();
+            }
+            ws.write_string(1, 0, "長谷川").unwrap();
+            ws.write_string(1, 1, "2階裏").unwrap();
+            ws.write_string(1, 2, "検査スタッフ").unwrap();
+            ws.write_string(1, 3, "正社員").unwrap();
+            ws.write_string(1, 4, "週5日").unwrap();
+            ws.write_string(1, 5, "火曜").unwrap();
+            ws.write_string(1, 6, "AND").unwrap();
+            ws.write_string(1, 7, "").unwrap();
+
+            ws.write_string(2, 0, "石橋").unwrap();
+            ws.write_string(2, 1, "2階裏").unwrap();
+            ws.write_string(2, 2, "看護師").unwrap();
+            ws.write_string(2, 3, "パート").unwrap();
+            ws.write_string(2, 4, "週４日").unwrap(); // 全角４
+            ws.write_string(2, 5, "土曜").unwrap();
+            ws.write_string(2, 6, "AND").unwrap();
+            ws.write_string(2, 7, "").unwrap();
+        }
+        {
+            let ws = wx.add_worksheet();
+            ws.set_name("シフト制約条件").unwrap();
+            for (c, h) in ["ルール名", "適用条件", "レベル", "対象スタッフ", "最小人数", "最大人数", "推奨人数"]
+                .iter()
+                .enumerate()
+            {
+                ws.write_string(0, c as u16, *h).unwrap();
+            }
+            // 旧重複ルール（石橋 / 堀・江原の「手術のある日」）-> 自動除外対象
+            ws.write_string(1, 0, "Ope日2階裏体制（火曜以外）").unwrap();
+            ws.write_string(1, 1, "手術のある日").unwrap();
+            ws.write_string(1, 2, "HARD1").unwrap();
+            ws.write_string(1, 3, "石橋").unwrap();
+            ws.write_number(1, 4, 1.0).unwrap();
+            ws.write_number(1, 5, 99.0).unwrap();
+            ws.write_number(1, 6, 1.0).unwrap();
+
+            ws.write_string(2, 0, "Ope日看護師体制").unwrap();
+            ws.write_string(2, 1, "手術のある日").unwrap();
+            ws.write_string(2, 2, "HIGH2").unwrap();
+            ws.write_string(2, 3, "堀,江原").unwrap();
+            ws.write_number(2, 4, 1.0).unwrap();
+            ws.write_number(2, 5, 99.0).unwrap();
+            ws.write_number(2, 6, 2.0).unwrap();
+
+            // 未知条件文字列 -> 警告＆エラーフラグ
+            ws.write_string(3, 0, "不明条件テスト").unwrap();
+            ws.write_string(3, 1, "月末").unwrap();
+            ws.write_string(3, 2, "HARD1").unwrap();
+            ws.write_string(3, 3, "長谷川").unwrap();
+            ws.write_number(3, 4, 1.0).unwrap();
+            ws.write_number(3, 5, 99.0).unwrap();
+            ws.write_number(3, 6, 1.0).unwrap();
+        }
+        {
+            let ws = wx.add_worksheet();
+            ws.set_name("手術スケジュール").unwrap();
+            ws.write_string(0, 0, "日付").unwrap();
+            ws.write_string(0, 1, "手術種別").unwrap();
+            ws.write_string(1, 0, "2026-09-02").unwrap();
+            ws.write_string(1, 1, "cat").unwrap();
+        }
+        wx.save(&legacy_xlsx).unwrap();
+    }
+
+    let legacy_parsed = parse_shift_excel(&legacy_xlsx, &holidays).expect("旧Excel読込成功");
+    let _ = fs::remove_file(&legacy_xlsx);
+    let leg_hase = legacy_parsed.staffs.iter().find(|s| s.name == "長谷川").unwrap();
+    assert!(leg_hase.is_early_leave, "旧フォーマットでは氏名フォールバックで長谷川の早上がりが有効");
+    let leg_ishi = legacy_parsed.staffs.iter().find(|s| s.name == "石橋").unwrap();
+    assert!(leg_ishi.pattern == "週4日", "全角「週４日」が「週4日」へNFKC正規化されること");
+    assert!(leg_ishi.is_ope_dedicated && leg_ishi.is_holiday_independent_week4 && leg_ishi.has_conditional_wed_off);
+    assert!(!leg_ishi.is_core, "属性付き固定週4スタッフはis_core=false");
+    assert!(
+        !legacy_parsed.rules.iter().any(|r| r.name.contains("Ope日2階裏体制")),
+        "旧重複Opeルールは自動除外されること"
+    );
+    assert!(
+        legacy_parsed.rules.iter().any(|r| r.is_invalid_condition),
+        "未知条件ルールは is_invalid_condition=true となること"
     );
 }
 
